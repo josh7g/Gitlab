@@ -9,3 +9,4 @@ gunicorn==21.2.0
 python-dotenv==1.0.0
 asyncio==3.4.3
 aiohttp==3.9.1
+semgrep==1.96.0
