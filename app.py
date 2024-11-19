@@ -244,6 +244,7 @@ class GitLabIntegration:
         finally:
             session.close()
 
+    @staticmethod
     async def verify_semgrep():
         """Verify semgrep is installed and working"""
         try:
@@ -260,6 +261,7 @@ class GitLabIntegration:
         except Exception as e:
             logger.error(f"Semgrep verification error: {str(e)}")
             return False
+
 
 
     async def _scan_repository(self, user_id: str, repo_id: int, access_token: str, 
