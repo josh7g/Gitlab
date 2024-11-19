@@ -275,6 +275,8 @@ class GitLabIntegration:
             # Verify semgrep is available
             if not await self.verify_semgrep():  # Add self. and await
                 raise Exception("Semgrep is not properly installed") 
+            import resource
+            resource.setrlimit(resource.RLIMIT_AS, (256 * 1024 * 1024, -1))
             # Fetch scan object with error handling
             scan = session.query(ScanResult).get(scan_id)
             if not scan:
@@ -314,8 +316,10 @@ class GitLabIntegration:
                     "--config", "auto",
                     "--json",
                     "--quiet",
-                    "--timeout", "60",
-                    "--max-memory", "384",
+                    "--timeout", "30",  # Reduced from 60
+                    "--max-memory", "256",  # Reduced from 384
+                    "--jobs", "1",  # Limit parallel processing
+                    "--max-target-bytes", "1000000",  # Limit file size
                     str(temp_dir)
                 ]
                 
