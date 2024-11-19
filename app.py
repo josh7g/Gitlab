@@ -271,9 +271,8 @@ class GitLabIntegration:
         
         try:
             # Verify semgrep is available
-            if not await verify_semgrep():
-                raise Exception("Semgrep is not properly installed")
-                    
+            if not await self.verify_semgrep():  # Add self. and await
+                raise Exception("Semgrep is not properly installed") 
             # Fetch scan object with error handling
             scan = session.query(ScanResult).get(scan_id)
             if not scan:
