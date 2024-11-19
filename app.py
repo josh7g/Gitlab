@@ -311,18 +311,20 @@ class GitLabIntegration:
                 # Run semgrep scan
                 import subprocess
                 cmd = [
-                    "semgrep",
-                    "scan",
-                    "--config", "auto",
-                    "--json",
-                    "--quiet",
-                    "--timeout", "30",  # Reduced from 60
-                    "--max-memory", "256",  # Reduced from 384
-                    "--jobs", "1",  # Limit parallel processing
-                    "--max-target-bytes", "1000000",  # Limit file size
-                    str(temp_dir)
+                "semgrep",
+                "scan",
+                "--config", "auto",
+                "--json",
+                "--quiet",
+                "--timeout", "20",
+                "--max-memory", "128",
+                "--jobs", "1",
+                "--max-target-bytes", "500000",
+                "--max-files", "1000",
+                "--timeout-threshold", "3",
+                str(temp_dir)
                 ]
-                
+                            
                 start_time = datetime.now()
                 process = await asyncio.create_subprocess_exec(
                     *cmd,
