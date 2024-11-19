@@ -85,96 +85,125 @@ class ScanResult(Base):
 # GitLab Integration Class
 class GitLabIntegration:
     def __init__(self, database_url: str, gitlab_url: str = "https://gitlab.com"):
-        self.engine = create_engine(database_url)
-        Base.metadata.create_all(self.engine)  # Create tables if they don't exist
+        self.engine = create_engine(database_url, pool_size=5, max_overflow=10)
+        Base.metadata.create_all(self.engine)
         self.Session = sessionmaker(bind=self.engine)
         self.gitlab_url = gitlab_url
+        self._scan_semaphore = asyncio.Semaphore(1)  # Limit to 1 concurrent scan
 
-    async def connect_gitlab_account(self, user_id: str, access_token: str) -> dict:
-        """Connect user's GitLab account and trigger scans for their repositories"""
-        try:
-            # Initialize GitLab connection
-            gl = gitlab.Gitlab(self.gitlab_url, private_token=access_token)
-            gl.auth()
-            
-            # Get user's repositories
-            projects = gl.projects.list(owned=True, all=True)
-            
+    async def _scan_repository(self, user_id: str, repo_id: int, access_token: str, 
+                             gitlab_project_id: int, scan_id: int):
+        """Run Semgrep scan on a repository and store results"""
+        async with self._scan_semaphore:  # Ensure only one scan runs at a time
             session = self.Session()
-            processed_repos = []
-            
-            for project in projects:
+            temp_dir = None
+            try:
+                # Update scan status
+                scan = session.query(ScanResult).get(scan_id)
+                scan.status = ScanStatus.SCANNING
+                session.commit()
+                
+                # Limit clone depth and branch
+                temp_dir = Path(tempfile.mkdtemp(prefix='scanner_'))
+                gl = gitlab.Gitlab(self.gitlab_url, private_token=access_token)
+                project = gl.projects.get(gitlab_project_id)
+                
+                clone_url = project.http_url_to_repo.replace(
+                    "https://",
+                    f"https://oauth2:{access_token}@"
+                )
+                
+                # Clone with minimal history and single branch
+                import git
+                repo = git.Repo.clone_from(
+                    clone_url,
+                    temp_dir,
+                    depth=1,
+                    single_branch=True,
+                    branch=project.default_branch,
+                    no_tags=True
+                )
+                
+                # Run semgrep with memory constraints
+                cmd = [
+                    "semgrep",
+                    "scan",
+                    "--config", "auto",
+                    "--json",
+                    "--quiet",
+                    "--timeout", "60",  # Limit scan time to 60 seconds
+                    "--max-memory", "384",  # Limit memory usage to 384MB
+                    "--timeout-threshold", "3",  # Skip files that take too long
+                    str(temp_dir)
+                ]
+                
+                start_time = datetime.now()
                 try:
-                    # Check if repository already exists
-                    existing_repo = session.query(UserRepository).filter_by(
-                        user_id=user_id,
-                        gitlab_project_id=project.id
-                    ).first()
-                    
-                    if existing_repo:
-                        # Update existing repository
-                        existing_repo.repository_name = project.name
-                        existing_repo.repository_url = project.web_url
-                        repo = existing_repo
-                    else:
-                        # Create new repository record
-                        repo = UserRepository(
-                            user_id=user_id,
-                            gitlab_project_id=project.id,
-                            repository_name=project.name,
-                            repository_url=project.web_url,
-                            default_branch=project.default_branch,
-                            visibility=project.visibility,
-                            size_mb=project.statistics()['repository_size'] / 1024 / 1024
-                        )
-                        session.add(repo)
-                    
-                    session.flush()  # Get the repo ID
-                    
-                    # Create scan record
-                    scan = ScanResult(
-                        repository_id=repo.id,
-                        user_id=user_id,
-                        status=ScanStatus.PENDING,
-                        branch=project.default_branch
+                    process = await asyncio.create_subprocess_exec(
+                        *cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        limit=32768  # Limit subprocess memory
                     )
-                    session.add(scan)
                     
-                    processed_repos.append({
-                        'id': repo.id,
-                        'name': project.name,
-                        'url': project.web_url
-                    })
+                    stdout, stderr = await asyncio.wait_for(
+                        process.communicate(),
+                        timeout=70  # Total timeout including buffer
+                    )
+                    duration = (datetime.now() - start_time).total_seconds()
                     
-                    # Trigger async scan
-                    asyncio.create_task(self._scan_repository(
-                        user_id,
-                        repo.id,
-                        access_token,
-                        project.id,
-                        scan.id
-                    ))
+                    if process.returncode == 0:
+                        # Parse results
+                        import json
+                        results = json.loads(stdout)
+                        findings = results.get('results', [])
+                        
+                        # Limit stored findings to save memory
+                        if len(findings) > 100:
+                            findings = findings[:100]
+                            
+                        # Count severities
+                        severity_counts = {'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0}
+                        for finding in findings:
+                            severity = finding.get('extra', {}).get('severity', 'LOW').upper()
+                            severity_counts[severity] += 1
+                        
+                        scan.status = ScanStatus.COMPLETED
+                        scan.findings = findings
+                        scan.findings_count = len(findings)
+                        scan.critical_count = severity_counts['CRITICAL']
+                        scan.high_count = severity_counts['HIGH']
+                        scan.medium_count = severity_counts['MEDIUM']
+                        scan.low_count = severity_counts['LOW']
+                        scan.duration_seconds = duration
+                        scan.files_scanned = results.get('stats', {}).get('files_scanned', 0)
                     
+                except asyncio.TimeoutError:
+                    scan.status = ScanStatus.FAILED
+                    scan.error_message = "Scan timeout exceeded"
                 except Exception as e:
-                    logger.error(f"Error processing repository {project.name}: {str(e)}")
-                    continue
-            
-            session.commit()
-            
-            return {
-                'success': True,
-                'message': f'Successfully connected GitLab account and initiated scans for {len(processed_repos)} repositories',
-                'repositories': processed_repos
-            }
-            
-        except Exception as e:
-            logger.error(f"Error connecting GitLab account: {str(e)}")
-            return {
-                'success': False,
-                'error': str(e)
-            }
-        finally:
-            session.close()
+                    scan.status = ScanStatus.FAILED
+                    scan.error_message = f"Scan failed: {str(e)}"
+                
+                # Update repository last scan time
+                repo = session.query(UserRepository).get(repo_id)
+                repo.last_scan_at = datetime.utcnow()
+                
+                session.commit()
+                
+            except Exception as e:
+                logger.error(f"Error scanning repository {repo_id}: {str(e)}")
+                scan = session.query(ScanResult).get(scan_id)
+                scan.status = ScanStatus.FAILED
+                scan.error_message = str(e)
+                session.commit()
+            finally:
+                if temp_dir and temp_dir.exists():
+                    try:
+                        shutil.rmtree(temp_dir)
+                    except:
+                        pass
+                session.close()
 
     async def _scan_repository(self, user_id: str, repo_id: int, access_token: str, 
                              gitlab_project_id: int, scan_id: int):
