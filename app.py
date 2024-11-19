@@ -16,9 +16,17 @@ import aiohttp
 from pathlib import Path
 import tempfile
 import shutil
+import logging
+import sys
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
 logger = logging.getLogger(__name__)
 
 # Initialize SQLAlchemy
@@ -233,18 +241,25 @@ class GitLabIntegration:
     async def _scan_repository(self, user_id: str, repo_id: int, access_token: str, 
                              gitlab_project_id: int, scan_id: int):
         """Run Semgrep scan on a repository and store results"""
-        session = self.Session()
+        session = self.Session()  # Create new session for this async context
         temp_dir = None
+        
         try:
-            # Update scan status
+            # Fetch scan object within this session
             scan = session.query(ScanResult).get(scan_id)
+            if not scan:
+                logger.error(f"Could not find scan with ID {scan_id}")
+                return
+                
+            # Update scan status
             scan.status = ScanStatus.SCANNING
-            session.commit()
+            session.commit()  # Commit the status change
             
-            # Clone repository to temporary directory
-            gl = gitlab.Gitlab(self.gitlab_url, private_token=access_token)
+            # Initialize GitLab client
+            gl = gitlab.Gitlab(self.gitlab_url, oauth_token=access_token)
             project = gl.projects.get(gitlab_project_id)
             
+            # Create temporary directory for cloning
             temp_dir = Path(tempfile.mkdtemp(prefix='scanner_'))
             clone_url = project.http_url_to_repo.replace(
                 "https://",
@@ -252,78 +267,107 @@ class GitLabIntegration:
             )
             
             # Clone repository
-            import git
-            repo = git.Repo.clone_from(
-                clone_url,
-                temp_dir,
-                depth=1,
-                branch=project.default_branch
-            )
-            
-            # Run semgrep scan
-            import subprocess
-            cmd = [
-                "semgrep",
-                "scan",
-                "--config", "auto",
-                "--json",
-                "--quiet",
-                str(temp_dir)
-            ]
-            
-            start_time = datetime.now()
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            
-            stdout, stderr = await process.communicate()
-            duration = (datetime.now() - start_time).total_seconds()
-            
-            if process.returncode == 0:
-                # Parse results
-                import json
-                results = json.loads(stdout)
-                findings = results.get('results', [])
+            try:
+                import git
+                repo = git.Repo.clone_from(
+                    clone_url,
+                    temp_dir,
+                    depth=1,
+                    branch=project.default_branch
+                )
                 
-                # Count severities
-                severity_counts = {'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0}
-                for finding in findings:
-                    severity = finding.get('extra', {}).get('severity', 'LOW').upper()
-                    severity_counts[severity] += 1
+                # Run semgrep scan
+                import subprocess
+                cmd = [
+                    "semgrep",
+                    "scan",
+                    "--config", "auto",
+                    "--json",
+                    "--quiet",
+                    "--timeout", "60",
+                    "--max-memory", "384",
+                    str(temp_dir)
+                ]
                 
-                # Update scan record
-                scan.status = ScanStatus.COMPLETED
-                scan.findings = findings
-                scan.findings_count = len(findings)
-                scan.critical_count = severity_counts['CRITICAL']
-                scan.high_count = severity_counts['HIGH']
-                scan.medium_count = severity_counts['MEDIUM']
-                scan.low_count = severity_counts['LOW']
-                scan.duration_seconds = duration
-                scan.files_scanned = results.get('stats', {}).get('files_scanned', 0)
+                start_time = datetime.now()
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
                 
-            else:
+                try:
+                    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=70)
+                    duration = (datetime.now() - start_time).total_seconds()
+                    
+                    if process.returncode == 0:
+                        # Parse results
+                        import json
+                        results = json.loads(stdout)
+                        findings = results.get('results', [])[:100]  # Limit to 100 findings
+                        
+                        # Count severities
+                        severity_counts = {'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0}
+                        for finding in findings:
+                            severity = finding.get('extra', {}).get('severity', 'LOW').upper()
+                            severity_counts[severity] += 1
+                        
+                        # Refresh scan object from database
+                        session.refresh(scan)
+                        scan.status = ScanStatus.COMPLETED
+                        scan.findings = findings
+                        scan.findings_count = len(findings)
+                        scan.critical_count = severity_counts['CRITICAL']
+                        scan.high_count = severity_counts['HIGH']
+                        scan.medium_count = severity_counts['MEDIUM']
+                        scan.low_count = severity_counts['LOW']
+                        scan.duration_seconds = duration
+                        scan.files_scanned = results.get('stats', {}).get('files_scanned', 0)
+                        
+                    else:
+                        # Refresh scan object from database
+                        session.refresh(scan)
+                        scan.status = ScanStatus.FAILED
+                        scan.error_message = stderr.decode()
+                        
+                except asyncio.TimeoutError:
+                    # Refresh scan object from database
+                    session.refresh(scan)
+                    scan.status = ScanStatus.FAILED
+                    scan.error_message = "Scan timeout exceeded"
+                    
+            except Exception as e:
+                # Refresh scan object from database
+                session.refresh(scan)
                 scan.status = ScanStatus.FAILED
-                scan.error_message = stderr.decode()
+                scan.error_message = str(e)
+                logger.error(f"Error during repository scan: {str(e)}")
             
             # Update repository last scan time
             repo = session.query(UserRepository).get(repo_id)
-            repo.last_scan_at = datetime.utcnow()
+            if repo:
+                repo.last_scan_at = datetime.utcnow()
             
             session.commit()
             
         except Exception as e:
             logger.error(f"Error scanning repository {repo_id}: {str(e)}")
-            scan = session.query(ScanResult).get(scan_id)
-            scan.status = ScanStatus.FAILED
-            scan.error_message = str(e)
-            session.commit()
+            try:
+                # One final attempt to update scan status
+                scan = session.query(ScanResult).get(scan_id)
+                if scan:
+                    scan.status = ScanStatus.FAILED
+                    scan.error_message = str(e)
+                    session.commit()
+            except:
+                logger.error("Failed to update scan status after error")
         finally:
             # Cleanup
             if temp_dir and temp_dir.exists():
-                shutil.rmtree(temp_dir)
+                try:
+                    shutil.rmtree(temp_dir)
+                except Exception as e:
+                    logger.error(f"Failed to cleanup temporary directory: {str(e)}")
             session.close()
 
     async def get_user_scan_results(self, user_id: str) -> dict:
