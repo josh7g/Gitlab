@@ -1,11 +1,21 @@
 services:
   - type: web
-    name: Maestro
+    name: gitlab-analysis
     env: python
     buildCommand: |
+      # Install system dependencies
+      curl -sSL https://github.com/returntocorp/semgrep/releases/download/v1.50.0/semgrep-v1.50.0-ubuntu-20.04.tgz -o semgrep.tgz
+      tar -xzf semgrep.tgz
+      sudo mv semgrep /usr/local/bin/
+      # Install Python dependencies
       pip install -r requirements.txt
-      python -m pip install semgrep
     startCommand: gunicorn app:app
     envVars:
       - key: PYTHON_VERSION
         value: 3.9.0
+      - key: PATH
+        value: /usr/local/bin:${PATH}
+    scaling:
+      minInstances: 1
+      maxInstances: 1
+    healthCheckPath: /health

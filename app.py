@@ -98,7 +98,8 @@ class GitLabIntegration:
         Base.metadata.create_all(self.engine)
         self.Session = sessionmaker(bind=self.engine)
         self.gitlab_url = gitlab_url
-
+    
+    
     async def connect_gitlab_account(self, user_id: str, access_token: str) -> dict:
         """Connect user's GitLab account and trigger scans for their repositories"""
         session = self.Session()
@@ -243,19 +244,36 @@ class GitLabIntegration:
         finally:
             session.close()
 
+    async def verify_semgrep():
+        """Verify semgrep is installed and working"""
+        try:
+            import subprocess
+            result = subprocess.run(['semgrep', '--version'], 
+                                    capture_output=True, 
+                                    text=True)
+            if result.returncode == 0:
+                logger.info(f"Semgrep verified: {result.stdout.strip()}")
+                return True
+            else:
+                logger.error(f"Semgrep check failed: {result.stderr}")
+                return False
+        except Exception as e:
+            logger.error(f"Semgrep verification error: {str(e)}")
+            return False
+
+
     async def _scan_repository(self, user_id: str, repo_id: int, access_token: str, 
-                             gitlab_project_id: int, scan_id: int):
+                         gitlab_project_id: int, scan_id: int):
         """Run Semgrep scan on a repository and store results"""
         logger.info(f"Starting scan {scan_id} for repository {repo_id}")
         session = self.Session()
         temp_dir = None
         
         try:
-            # Verify we have a valid scan ID
-            if not scan_id:
-                logger.error("Invalid scan ID provided")
-                return
-                
+            # Verify semgrep is available
+            if not await verify_semgrep():
+                raise Exception("Semgrep is not properly installed")
+                    
             # Fetch scan object with error handling
             scan = session.query(ScanResult).get(scan_id)
             if not scan:
@@ -364,21 +382,19 @@ class GitLabIntegration:
         except Exception as e:
             logger.error(f"Error scanning repository {repo_id}: {str(e)}")
             try:
-                # One final attempt to update scan status
                 scan = session.query(ScanResult).get(scan_id)
                 if scan:
                     scan.status = ScanStatus.FAILED
                     scan.error_message = str(e)
                     session.commit()
-            except:
-                logger.error("Failed to update scan status after error")
+            except Exception as inner_e:
+                logger.error(f"Failed to update scan status: {str(inner_e)}")
         finally:
-            # Cleanup
             if temp_dir and temp_dir.exists():
                 try:
                     shutil.rmtree(temp_dir)
                 except Exception as e:
-                    logger.error(f"Failed to cleanup temporary directory: {str(e)}")
+                    logger.error(f"Failed to cleanup temp directory: {str(e)}")
             session.close()
 
     async def get_user_scan_results(self, user_id: str) -> dict:
@@ -582,3 +598,25 @@ async def get_scan_status(scan_id):
     except Exception as e:
         logger.error(f"Error getting scan status: {str(e)}")
         return jsonify({'error': str(e)}), 500
+
+@app.route('/health')
+def health_check():
+    """Health check endpoint that also verifies semgrep installation"""
+    try:
+        # Check if semgrep is installed and accessible
+        import subprocess
+        result = subprocess.run(['semgrep', '--version'], 
+                              capture_output=True, 
+                              text=True)
+        semgrep_version = result.stdout.strip()
+        
+        return jsonify({
+            'status': 'healthy',
+            'semgrep_version': semgrep_version
+        })
+    except Exception as e:
+        logger.error(f"Health check failed: {str(e)}")
+        return jsonify({
+            'status': 'unhealthy',
+            'error': str(e)
+        }), 500
