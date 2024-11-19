@@ -1,5 +1,4 @@
 from flask import Flask, request, redirect, jsonify, session
-import asyncio
 import os
 from functools import wraps
 import requests
@@ -12,6 +11,8 @@ from sqlalchemy.dialects.postgresql import JSONB
 import enum
 import gitlab
 from typing import Dict, Optional
+import asyncio
+import aiohttp  
 from pathlib import Path
 import tempfile
 import shutil
