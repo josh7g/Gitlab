@@ -265,66 +265,73 @@ class GitLabIntegration:
 
 
     async def _scan_repository(self, user_id: str, repo_id: int, access_token: str, 
-                         gitlab_project_id: int, scan_id: int):
+                    gitlab_project_id: int, scan_id: int):
         """Run Semgrep scan on a repository and store results"""
         logger.info(f"Starting scan {scan_id} for repository {repo_id}")
         session = self.Session()
         temp_dir = None
+        process = None
         
         try:
-            # Verify semgrep is available
-            if not await self.verify_semgrep():  # Add self. and await
-                raise Exception("Semgrep is not properly installed") 
+            if not await self.verify_semgrep():
+                raise Exception("Semgrep is not properly installed")
+
             import resource
             resource.setrlimit(resource.RLIMIT_AS, (256 * 1024 * 1024, -1))
-            # Fetch scan object with error handling
+
             scan = session.query(ScanResult).get(scan_id)
             if not scan:
                 logger.error(f"Could not find scan with ID {scan_id}")
                 return
             
-            # Update scan status
             scan.status = ScanStatus.SCANNING
             session.commit()
             
-            # Initialize GitLab client
             gl = gitlab.Gitlab(self.gitlab_url, oauth_token=access_token)
             project = gl.projects.get(gitlab_project_id)
             
-            # Create temporary directory for cloning
+            # Check repository size
+            if project.statistics()['repository_size'] / 1024 / 1024 > 100:
+                scan.status = ScanStatus.FAILED
+                scan.error_message = "Repository too large (>100MB)"
+                session.commit()
+                return
+                
             temp_dir = Path(tempfile.mkdtemp(prefix='scanner_'))
             clone_url = project.http_url_to_repo.replace(
                 "https://",
                 f"https://oauth2:{access_token}@"
             )
             
-            # Clone repository
             try:
                 import git
                 repo = git.Repo.clone_from(
                     clone_url,
                     temp_dir,
                     depth=1,
-                    branch=project.default_branch
+                    branch=project.default_branch,
+                    env={
+                        'GIT_HTTP_LOW_SPEED_LIMIT': '1000',
+                        'GIT_HTTP_LOW_SPEED_TIME': '10'
+                    },
+                    filter=['blob:none']
                 )
                 
-                # Run semgrep scan
-                import subprocess
                 cmd = [
-                "semgrep",
-                "scan",
-                "--config", "auto",
-                "--json",
-                "--quiet",
-                "--timeout", "20",
-                "--max-memory", "128",
-                "--jobs", "1",
-                "--max-target-bytes", "500000",
-                "--max-files", "1000",
-                "--timeout-threshold", "3",
-                str(temp_dir)
+                    "semgrep",
+                    "scan",
+                    "--config", "auto",
+                    "--json",
+                    "--quiet",
+                    "--timeout", "20",
+                    "--max-memory", "128",
+                    "--jobs", "1",
+                    "--max-target-bytes", "500000",
+                    "--max-files", "1000",
+                    "--timeout-threshold", "3",
+                    str(temp_dir)
                 ]
-                            
+                
                 start_time = datetime.now()
                 process = await asyncio.create_subprocess_exec(
                     *cmd,
@@ -333,22 +340,19 @@ class GitLabIntegration:
                 )
                 
                 try:
-                    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=70)
+                    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30)
                     duration = (datetime.now() - start_time).total_seconds()
                     
                     if process.returncode == 0:
-                        # Parse results
                         import json
                         results = json.loads(stdout)
-                        findings = results.get('results', [])[:100]  # Limit to 100 findings
+                        findings = results.get('results', [])[:100]
                         
-                        # Count severities
                         severity_counts = {'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0}
                         for finding in findings:
                             severity = finding.get('extra', {}).get('severity', 'LOW').upper()
                             severity_counts[severity] += 1
                         
-                        # Refresh scan object from database
                         session.refresh(scan)
                         scan.status = ScanStatus.COMPLETED
                         scan.findings = findings
@@ -361,25 +365,21 @@ class GitLabIntegration:
                         scan.files_scanned = results.get('stats', {}).get('files_scanned', 0)
                         
                     else:
-                        # Refresh scan object from database
                         session.refresh(scan)
                         scan.status = ScanStatus.FAILED
                         scan.error_message = stderr.decode()
                         
                 except asyncio.TimeoutError:
-                    # Refresh scan object from database
                     session.refresh(scan)
                     scan.status = ScanStatus.FAILED
                     scan.error_message = "Scan timeout exceeded"
                     
             except Exception as e:
-                # Refresh scan object from database
                 session.refresh(scan)
                 scan.status = ScanStatus.FAILED
                 scan.error_message = str(e)
                 logger.error(f"Error during repository scan: {str(e)}")
             
-            # Update repository last scan time
             repo = session.query(UserRepository).get(repo_id)
             if repo:
                 repo.last_scan_at = datetime.utcnow()
@@ -396,72 +396,79 @@ class GitLabIntegration:
                     session.commit()
             except Exception as inner_e:
                 logger.error(f"Failed to update scan status: {str(inner_e)}")
+                
         finally:
+            if process:
+                try:
+                    process.kill()
+                except:
+                    pass
+                    
             if temp_dir and temp_dir.exists():
                 try:
                     shutil.rmtree(temp_dir)
                 except Exception as e:
                     logger.error(f"Failed to cleanup temp directory: {str(e)}")
+                    
             session.close()
-
-    async def get_user_scan_results(self, user_id: str) -> dict:
-        """Get scan results for all user's repositories"""
-        session = self.Session()
-        try:
-            repositories = session.query(UserRepository).filter_by(
-                user_id=user_id,
-                is_active=True
-            ).all()
-            
-            results = []
-            for repo in repositories:
-                latest_scan = (
-                    session.query(ScanResult)
-                    .filter_by(repository_id=repo.id)
-                    .order_by(ScanResult.scan_date.desc())
-                    .first()
-                )
-                
-                if latest_scan:
-                    results.append({
-                        'repository': {
-                            'id': repo.id,
-                            'name': repo.repository_name,
-                            'url': repo.repository_url,
-                            'last_scan': repo.last_scan_at.isoformat() if repo.last_scan_at else None
-                        },
-                        'scan_results': {
-                            'status': latest_scan.status.value,
-                            'scan_date': latest_scan.scan_date.isoformat(),
-                            'findings_count': latest_scan.findings_count,
-                            'severity_counts': {
-                                'critical': latest_scan.critical_count,
-                                'high': latest_scan.high_count,
-                                'medium': latest_scan.medium_count,
-                                'low': latest_scan.low_count
-                            }
-                        } if latest_scan.status == ScanStatus.COMPLETED else {
-                            'status': latest_scan.status.value,
-                            'error': latest_scan.error_message
+            async def get_user_scan_results(self, user_id: str) -> dict:
+                """Get scan results for all user's repositories"""
+                session = self.Session()
+                try:
+                    repositories = session.query(UserRepository).filter_by(
+                        user_id=user_id,
+                        is_active=True
+                    ).all()
+                    
+                    results = []
+                    for repo in repositories:
+                        latest_scan = (
+                            session.query(ScanResult)
+                            .filter_by(repository_id=repo.id)
+                            .order_by(ScanResult.scan_date.desc())
+                            .first()
+                        )
+                        
+                        if latest_scan:
+                            results.append({
+                                'repository': {
+                                    'id': repo.id,
+                                    'name': repo.repository_name,
+                                    'url': repo.repository_url,
+                                    'last_scan': repo.last_scan_at.isoformat() if repo.last_scan_at else None
+                                },
+                                'scan_results': {
+                                    'status': latest_scan.status.value,
+                                    'scan_date': latest_scan.scan_date.isoformat(),
+                                    'findings_count': latest_scan.findings_count,
+                                    'severity_counts': {
+                                        'critical': latest_scan.critical_count,
+                                        'high': latest_scan.high_count,
+                                        'medium': latest_scan.medium_count,
+                                        'low': latest_scan.low_count
+                                    }
+                                } if latest_scan.status == ScanStatus.COMPLETED else {
+                                    'status': latest_scan.status.value,
+                                    'error': latest_scan.error_message
+                                }
+                            })
+                    
+                    return {
+                        'success': True,
+                        'data': {
+                            'user_id': user_id,
+                            'repositories': results
                         }
-                    })
-            
-            return {
-                'success': True,
-                'data': {
-                    'user_id': user_id,
-                    'repositories': results
-                }
-            }
-            
-        except Exception as e:
-            logger.error(f"Error getting scan results: {str(e)}")
-            return {
-                'success': False,
-                'error': str(e)
-            }
-        finally:
-            session.close()
+                    }
+                    
+                except Exception as e:
+                    logger.error(f"Error getting scan results: {str(e)}")
+                    return {
+                        'success': False,
+                        'error': str(e)
+                    }
+                finally:
+                    session.close()
     
     async def get_scan_status(self, scan_id: int) -> dict:
         """Get the current status of a scan"""
