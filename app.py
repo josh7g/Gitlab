@@ -87,21 +87,20 @@ class ScanResult(Base):
 class GitLabIntegration:
     def __init__(self, database_url: str, gitlab_url: str = "https://gitlab.com"):
         self.engine = create_engine(database_url)
-        Base.metadata.create_all(self.engine)  # Create tables if they don't exist
+        Base.metadata.create_all(self.engine)
         self.Session = sessionmaker(bind=self.engine)
         self.gitlab_url = gitlab_url
 
     async def connect_gitlab_account(self, user_id: str, access_token: str) -> dict:
         """Connect user's GitLab account and trigger scans for their repositories"""
+        session = self.Session()  # Move session creation here
         try:
-            # Initialize GitLab connection
-            gl = gitlab.Gitlab(self.gitlab_url, private_token=access_token)
+            # Initialize GitLab connection with the correct token format
+            gl = gitlab.Gitlab(self.gitlab_url, oauth_token=access_token)  # Changed from private_token to oauth_token
             gl.auth()
             
             # Get user's repositories
             projects = gl.projects.list(owned=True, all=True)
-            
-            session = self.Session()
             processed_repos = []
             
             for project in projects:
@@ -113,12 +112,10 @@ class GitLabIntegration:
                     ).first()
                     
                     if existing_repo:
-                        # Update existing repository
                         existing_repo.repository_name = project.name
                         existing_repo.repository_url = project.web_url
                         repo = existing_repo
                     else:
-                        # Create new repository record
                         repo = UserRepository(
                             user_id=user_id,
                             gitlab_project_id=project.id,
@@ -126,13 +123,13 @@ class GitLabIntegration:
                             repository_url=project.web_url,
                             default_branch=project.default_branch,
                             visibility=project.visibility,
-                            size_mb=project.statistics()['repository_size'] / 1024 / 1024
+                            # Handle case where statistics might not be available
+                            size_mb=project.statistics()['repository_size'] / 1024 / 1024 if hasattr(project, 'statistics') else 0
                         )
                         session.add(repo)
                     
-                    session.flush()  # Get the repo ID
+                    session.flush()
                     
-                    # Create scan record
                     scan = ScanResult(
                         repository_id=repo.id,
                         user_id=user_id,
@@ -161,7 +158,6 @@ class GitLabIntegration:
                     continue
             
             session.commit()
-            
             return {
                 'success': True,
                 'message': f'Successfully connected GitLab account and initiated scans for {len(processed_repos)} repositories',
@@ -170,10 +166,8 @@ class GitLabIntegration:
             
         except Exception as e:
             logger.error(f"Error connecting GitLab account: {str(e)}")
-            return {
-                'success': False,
-                'error': str(e)
-            }
+            session.rollback()
+            raise
         finally:
             session.close()
 
@@ -453,33 +447,49 @@ async def gitlab_callback():
                 token_data = await response.json()
                 
                 if 'error' in token_data:
+                    logger.error(f"GitLab OAuth error: {token_data['error']}")
                     return jsonify({'error': token_data['error']}), 400
+                
+                if 'access_token' not in token_data:
+                    logger.error(f"No access token in response: {token_data}")
+                    return jsonify({'error': 'No access token received'}), 400
                 
                 # Get user info
                 headers = {'Authorization': f"Bearer {token_data['access_token']}"}
                 async with client_session.get(f"{GITLAB_URL}/api/v4/user", headers=headers) as user_response:
                     user_data = await user_response.json()
                     
-                    # Store in session
+                    if 'id' not in user_data:
+                        logger.error(f"Invalid user data response: {user_data}")
+                        return jsonify({'error': 'Failed to get user info'}), 400
+                    
+                    # Store in flask session
                     session['gitlab_token'] = token_data['access_token']
                     session['gitlab_user_id'] = user_data['id']
                     
-                    # Start scanning repositories
-                    scan_result = await gitlab_integration.connect_gitlab_account(
-                        user_id=str(user_data['id']),
-                        access_token=token_data['access_token']
-                    )
-                    
-                    return jsonify({
-                        'success': True,
-                        'message': 'Successfully connected GitLab account',
-                        'scan_initiated': scan_result
-                    })
+                    try:
+                        # Start scanning repositories
+                        scan_result = await gitlab_integration.connect_gitlab_account(
+                            user_id=str(user_data['id']),
+                            access_token=token_data['access_token']
+                        )
+                        
+                        return jsonify({
+                            'success': True,
+                            'message': 'Successfully connected GitLab account',
+                            'scan_initiated': scan_result
+                        })
+                    except Exception as e:
+                        logger.error(f"Repository scan error: {str(e)}")
+                        return jsonify({
+                            'success': False,
+                            'error': 'Connected to GitLab but failed to scan repositories'
+                        }), 500
                     
     except Exception as e:
         logger.error(f"OAuth error: {str(e)}")
         return jsonify({'error': 'OAuth process failed'}), 500
-
+    
 @app.route('/api/gitlab/repos')
 @requires_auth
 async def list_repos():
