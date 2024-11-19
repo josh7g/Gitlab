@@ -279,7 +279,7 @@ class GitLabIntegration:
                 raise Exception("Semgrep is not properly installed")
 
             import resource
-            resource.setrlimit(resource.RLIMIT_NPROC, (4096, 4096))
+            resource.setrlimit(resource.RLIMIT_AS, (256 * 1024 * 1024, -1))
 
             scan = session.query(ScanResult).get(scan_id)
             if not scan:
@@ -291,21 +291,7 @@ class GitLabIntegration:
             
             gl = gitlab.Gitlab(self.gitlab_url, oauth_token=access_token)
             project = gl.projects.get(gitlab_project_id)
-            
-            # Get repository size
-            try:
-                stats = project.additional_statistics()
-                repo_size_mb = stats.get('repository_size', 0) / 1024 / 1024
-                
-                if repo_size_mb > 100:
-                    scan.status = ScanStatus.FAILED
-                    scan.error_message = "Repository too large (>100MB)"
-                    session.commit()
-                    return
-            except Exception as e:
-                logger.warning(f"Failed to get repository size: {str(e)}")
-                # Continue anyway if we can't get the size
-                
+                    
             temp_dir = Path(tempfile.mkdtemp(prefix='scanner_'))
             clone_url = project.http_url_to_repo.replace(
                 "https://",
@@ -319,11 +305,10 @@ class GitLabIntegration:
                     temp_dir,
                     depth=1,
                     branch=project.default_branch,
-                    env={
-                        'GIT_HTTP_LOW_SPEED_LIMIT': '1000',
-                        'GIT_HTTP_LOW_SPEED_TIME': '10'
-                    },
-                    filter=['blob:none']
+                    single_branch=True,
+                    filter=['blob:none'],
+                    env={'GIT_HTTP_LOW_SPEED_LIMIT': '1000', 
+                            'GIT_HTTP_LOW_SPEED_TIME': '10'}
                 )
                 
                 cmd = [
@@ -332,12 +317,12 @@ class GitLabIntegration:
                     "--config", "auto",
                     "--json",
                     "--quiet",
-                    "--timeout", "20",
-                    "--max-memory", "128",
-                    "--jobs", "1",
-                    "--max-target-bytes", "500000",
-                    "--max-files", "1000",
-                    "--timeout-threshold", "3",
+                    "--timeout", "10",
+                    "--max-memory", "64",
+                    "--jobs", "1", 
+                    "--max-target-bytes", "100000",
+                    "--max-files", "500",
+                    "--timeout-threshold", "2",
                     str(temp_dir)
                 ]
                 
