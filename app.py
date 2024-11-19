@@ -18,6 +18,8 @@ import tempfile
 import shutil
 import logging
 import sys
+import resource
+
 
 # Configure logging
 logging.basicConfig(
@@ -277,7 +279,7 @@ class GitLabIntegration:
                 raise Exception("Semgrep is not properly installed")
 
             import resource
-            resource.setrlimit(resource.RLIMIT_AS, (256 * 1024 * 1024, -1))
+            resource.setrlimit(resource.RLIMIT_NPROC, (4096, 4096))
 
             scan = session.query(ScanResult).get(scan_id)
             if not scan:
@@ -290,12 +292,19 @@ class GitLabIntegration:
             gl = gitlab.Gitlab(self.gitlab_url, oauth_token=access_token)
             project = gl.projects.get(gitlab_project_id)
             
-            # Check repository size
-            if project.statistics()['repository_size'] / 1024 / 1024 > 100:
-                scan.status = ScanStatus.FAILED
-                scan.error_message = "Repository too large (>100MB)"
-                session.commit()
-                return
+            # Get repository size
+            try:
+                stats = project.additional_statistics()
+                repo_size_mb = stats.get('repository_size', 0) / 1024 / 1024
+                
+                if repo_size_mb > 100:
+                    scan.status = ScanStatus.FAILED
+                    scan.error_message = "Repository too large (>100MB)"
+                    session.commit()
+                    return
+            except Exception as e:
+                logger.warning(f"Failed to get repository size: {str(e)}")
+                # Continue anyway if we can't get the size
                 
             temp_dir = Path(tempfile.mkdtemp(prefix='scanner_'))
             clone_url = project.http_url_to_repo.replace(
@@ -411,64 +420,6 @@ class GitLabIntegration:
                     logger.error(f"Failed to cleanup temp directory: {str(e)}")
                     
             session.close()
-            async def get_user_scan_results(self, user_id: str) -> dict:
-                """Get scan results for all user's repositories"""
-                session = self.Session()
-                try:
-                    repositories = session.query(UserRepository).filter_by(
-                        user_id=user_id,
-                        is_active=True
-                    ).all()
-                    
-                    results = []
-                    for repo in repositories:
-                        latest_scan = (
-                            session.query(ScanResult)
-                            .filter_by(repository_id=repo.id)
-                            .order_by(ScanResult.scan_date.desc())
-                            .first()
-                        )
-                        
-                        if latest_scan:
-                            results.append({
-                                'repository': {
-                                    'id': repo.id,
-                                    'name': repo.repository_name,
-                                    'url': repo.repository_url,
-                                    'last_scan': repo.last_scan_at.isoformat() if repo.last_scan_at else None
-                                },
-                                'scan_results': {
-                                    'status': latest_scan.status.value,
-                                    'scan_date': latest_scan.scan_date.isoformat(),
-                                    'findings_count': latest_scan.findings_count,
-                                    'severity_counts': {
-                                        'critical': latest_scan.critical_count,
-                                        'high': latest_scan.high_count,
-                                        'medium': latest_scan.medium_count,
-                                        'low': latest_scan.low_count
-                                    }
-                                } if latest_scan.status == ScanStatus.COMPLETED else {
-                                    'status': latest_scan.status.value,
-                                    'error': latest_scan.error_message
-                                }
-                            })
-                    
-                    return {
-                        'success': True,
-                        'data': {
-                            'user_id': user_id,
-                            'repositories': results
-                        }
-                    }
-                    
-                except Exception as e:
-                    logger.error(f"Error getting scan results: {str(e)}")
-                    return {
-                        'success': False,
-                        'error': str(e)
-                    }
-                finally:
-                    session.close()
     
     async def get_scan_status(self, scan_id: int) -> dict:
         """Get the current status of a scan"""

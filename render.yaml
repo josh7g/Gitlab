@@ -7,14 +7,9 @@ services:
       tar -xzf semgrep.tgz
       sudo mv semgrep /usr/local/bin/
       pip install -r requirements.txt
-    startCommand: gunicorn -c gunicorn_config.py app:app
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 2 --timeout 120
     envVars:
       - key: PYTHON_VERSION
         value: 3.9.0
       - key: PATH
         value: /usr/local/bin:${PATH}
-    scaling:
-      minInstances: 1
-      maxInstances: 1
-    healthCheckPath: /health
-    plan: starter # Upgrade to at least 1GB RAM
