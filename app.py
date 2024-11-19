@@ -101,19 +101,17 @@ class GitLabIntegration:
 
     async def connect_gitlab_account(self, user_id: str, access_token: str) -> dict:
         """Connect user's GitLab account and trigger scans for their repositories"""
-        session = self.Session()  # Move session creation here
+        session = self.Session()
         try:
-            # Initialize GitLab connection with the correct token format
-            gl = gitlab.Gitlab(self.gitlab_url, oauth_token=access_token)  # Changed from private_token to oauth_token
+            gl = gitlab.Gitlab(self.gitlab_url, oauth_token=access_token)
             gl.auth()
             
-            # Get user's repositories
             projects = gl.projects.list(owned=True, all=True)
             processed_repos = []
             
             for project in projects:
                 try:
-                    # Check if repository already exists
+                    # Check if repository exists
                     existing_repo = session.query(UserRepository).filter_by(
                         user_id=user_id,
                         gitlab_project_id=project.id
@@ -131,35 +129,42 @@ class GitLabIntegration:
                             repository_url=project.web_url,
                             default_branch=project.default_branch,
                             visibility=project.visibility,
-                            # Handle case where statistics might not be available
                             size_mb=project.statistics()['repository_size'] / 1024 / 1024 if hasattr(project, 'statistics') else 0
                         )
                         session.add(repo)
+                        session.flush()  # Flush to get the repo ID
                     
-                    session.flush()
-                    
+                    # Create and persist scan record before creating the task
                     scan = ScanResult(
                         repository_id=repo.id,
                         user_id=user_id,
                         status=ScanStatus.PENDING,
-                        branch=project.default_branch
+                        branch=project.default_branch,
+                        scan_date=datetime.utcnow()
                     )
                     session.add(scan)
+                    session.flush()  # Flush to get the scan ID
                     
                     processed_repos.append({
                         'id': repo.id,
                         'name': project.name,
-                        'url': project.web_url
+                        'url': project.web_url,
+                        'scan_id': scan.id  # Include scan ID in response
                     })
                     
-                    # Create background task for scanning
-                    asyncio.create_task(self._scan_repository(
-                        user_id,
-                        repo.id,
-                        access_token,
-                        project.id,
-                        scan.id
-                    ))
+                    logger.info(f"Created scan {scan.id} for repository {repo.id}")
+                    
+                    # Only create scan task if we have a valid scan ID
+                    if scan.id:
+                        asyncio.create_task(self._scan_repository(
+                            user_id=user_id,
+                            repo_id=repo.id,
+                            access_token=access_token,
+                            gitlab_project_id=project.id,
+                            scan_id=scan.id
+                        ))
+                    else:
+                        logger.error(f"Failed to get scan ID for repository {repo.id}")
                     
                 except Exception as e:
                     logger.error(f"Error processing repository {project.name}: {str(e)}")
@@ -178,7 +183,7 @@ class GitLabIntegration:
             raise
         finally:
             session.close()
-
+    
     async def get_user_scan_results(self, user_id: str) -> dict:
         """Get scan results for all user's repositories"""
         session = self.Session()
@@ -241,19 +246,25 @@ class GitLabIntegration:
     async def _scan_repository(self, user_id: str, repo_id: int, access_token: str, 
                              gitlab_project_id: int, scan_id: int):
         """Run Semgrep scan on a repository and store results"""
-        session = self.Session()  # Create new session for this async context
+        logger.info(f"Starting scan {scan_id} for repository {repo_id}")
+        session = self.Session()
         temp_dir = None
         
         try:
-            # Fetch scan object within this session
+            # Verify we have a valid scan ID
+            if not scan_id:
+                logger.error("Invalid scan ID provided")
+                return
+                
+            # Fetch scan object with error handling
             scan = session.query(ScanResult).get(scan_id)
             if not scan:
                 logger.error(f"Could not find scan with ID {scan_id}")
                 return
-                
+            
             # Update scan status
             scan.status = ScanStatus.SCANNING
-            session.commit()  # Commit the status change
+            session.commit()
             
             # Initialize GitLab client
             gl = gitlab.Gitlab(self.gitlab_url, oauth_token=access_token)
@@ -428,6 +439,24 @@ class GitLabIntegration:
             }
         finally:
             session.close()
+    
+    async def get_scan_status(self, scan_id: int) -> dict:
+        """Get the current status of a scan"""
+        session = self.Session()
+        try:
+            scan = session.query(ScanResult).get(scan_id)
+            if not scan:
+                return {'error': f'Scan {scan_id} not found'}
+            
+            return {
+                'scan_id': scan.id,
+                'status': scan.status.value,
+                'repository_id': scan.repository_id,
+                'error': scan.error_message if scan.error_message else None,
+                'findings_count': scan.findings_count if scan.status == ScanStatus.COMPLETED else None,
+            }
+        finally:
+            session.close()
 
 # Flask Application
 app = Flask(__name__)
@@ -542,3 +571,14 @@ async def list_repos():
         user_id=str(session['gitlab_user_id'])
     )
     return jsonify(results)
+
+@app.route('/api/gitlab/scan/<int:scan_id>/status')
+@requires_auth
+async def get_scan_status(scan_id):
+    """Get the status of a specific scan"""
+    try:
+        status = await gitlab_integration.get_scan_status(scan_id)
+        return jsonify(status)
+    except Exception as e:
+        logger.error(f"Error getting scan status: {str(e)}")
+        return jsonify({'error': str(e)}), 500
