@@ -1,4 +1,5 @@
 from flask import Flask, request, redirect, jsonify, session
+import asyncio
 import os
 from functools import wraps
 import requests
@@ -11,7 +12,6 @@ from sqlalchemy.dialects.postgresql import JSONB
 import enum
 import gitlab
 from typing import Dict, Optional
-import asyncio
 from pathlib import Path
 import tempfile
 import shutil
@@ -417,33 +417,34 @@ async def gitlab_callback():
     }
     
     try:
-        response = requests.post(token_url, data=data)
-        token_data = response.json()
-        
-        if 'error' in token_data:
-            return jsonify({'error': token_data['error']}), 400
-        
-        # Get user info
-        headers = {'Authorization': f"Bearer {token_data['access_token']}"}
-        user_response = requests.get(f"{GITLAB_URL}/api/v4/user", headers=headers)
-        user_data = user_response.json()
-        
-        # Store in session
-        session['gitlab_token'] = token_data['access_token']
-        session['gitlab_user_id'] = user_data['id']
-        
-        # Start scanning repositories
-        scan_result = await gitlab_integration.connect_gitlab_account(
-            user_id=str(user_data['id']),
-            access_token=token_data['access_token']
-        )
-        
-        return jsonify({
-            'success': True,
-            'message': 'Successfully connected GitLab account',
-            'scan_initiated': scan_result
-        })
-        
+        async with aiohttp.ClientSession() as client_session:
+            async with client_session.post(token_url, data=data) as response:
+                token_data = await response.json()
+                
+                if 'error' in token_data:
+                    return jsonify({'error': token_data['error']}), 400
+                
+                # Get user info
+                headers = {'Authorization': f"Bearer {token_data['access_token']}"}
+                async with client_session.get(f"{GITLAB_URL}/api/v4/user", headers=headers) as user_response:
+                    user_data = await user_response.json()
+                    
+                    # Store in session
+                    session['gitlab_token'] = token_data['access_token']
+                    session['gitlab_user_id'] = user_data['id']
+                    
+                    # Start scanning repositories
+                    scan_result = await gitlab_integration.connect_gitlab_account(
+                        user_id=str(user_data['id']),
+                        access_token=token_data['access_token']
+                    )
+                    
+                    return jsonify({
+                        'success': True,
+                        'message': 'Successfully connected GitLab account',
+                        'scan_initiated': scan_result
+                    })
+                    
     except Exception as e:
         logger.error(f"OAuth error: {str(e)}")
         return jsonify({'error': 'OAuth process failed'}), 500
@@ -456,6 +457,3 @@ async def list_repos():
         user_id=str(session['gitlab_user_id'])
     )
     return jsonify(results)
-
-if __name__ == '__main__':
-    app.run(debug=True)
