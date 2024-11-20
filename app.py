@@ -18,6 +18,7 @@ from sqlalchemy.orm import relationship, sessionmaker
 from sqlalchemy.dialects.postgresql import JSONB
 import enum
 import gitlab
+from asgiref.wsgi import WsgiToAsgi
 
 # Configure logging
 logging.basicConfig(
@@ -38,7 +39,6 @@ class ScanStatus(enum.Enum):
     COMPLETED = "completed"
     FAILED = "failed"
 
-# Database Models
 class UserRepository(Base):
     __tablename__ = 'user_repositories'
     
@@ -50,13 +50,9 @@ class UserRepository(Base):
     last_scan_at = Column(DateTime)
     created_at = Column(DateTime, default=datetime.utcnow)
     is_active = Column(Boolean, default=True)
-    
-    # Repository metadata
     default_branch = Column(String)
     visibility = Column(String)
     size_mb = Column(Float)
-    
-    # Relationships
     scan_results = relationship("ScanResult", back_populates="repository")
 
 class ScanResult(Base):
@@ -67,33 +63,23 @@ class ScanResult(Base):
     user_id = Column(String, nullable=False, index=True)
     scan_date = Column(DateTime, default=datetime.utcnow)
     status = Column(Enum(ScanStatus), default=ScanStatus.PENDING)
-    
-    # Scan metadata
     commit_sha = Column(String)
     branch = Column(String)
-    
-    # Results
     findings_count = Column(Integer, default=0)
     critical_count = Column(Integer, default=0)
     high_count = Column(Integer, default=0)
     medium_count = Column(Integer, default=0)
     low_count = Column(Integer, default=0)
-    
-    # Full results stored as JSONB
     findings = Column(JSONB)
     error_message = Column(Text, nullable=True)
-    
-    # Performance metrics
     duration_seconds = Column(Float)
     files_scanned = Column(Integer)
     files_skipped = Column(Integer)
-    
-    # Relationship
     repository = relationship("UserRepository", back_populates="scan_results")
 
 def set_memory_limits():
     """Set process memory limits"""
-    mem_limit = 256 * 1024 * 1024  # 256MB in bytes
+    mem_limit = 256 * 1024 * 1024  # 256MB
     try:
         resource.setrlimit(resource.RLIMIT_AS, (mem_limit, resource.RLIM_INFINITY))
     except Exception as e:
@@ -105,24 +91,17 @@ class GitLabIntegration:
         Base.metadata.create_all(self.engine)
         self.Session = sessionmaker(bind=self.engine)
         self.gitlab_url = gitlab_url
+        self.scan_semaphore = asyncio.Semaphore(2)
+        self.active_scans = set()
 
-    @staticmethod
-    async def verify_semgrep():
-        """Verify semgrep is installed and working"""
-        try:
-            import subprocess
-            result = subprocess.run(['semgrep', '--version'], 
-                                  capture_output=True, 
-                                  text=True)
-            if result.returncode == 0:
-                logger.info(f"Semgrep verified: {result.stdout.strip()}")
-                return True
-            else:
-                logger.error(f"Semgrep check failed: {result.stderr}")
-                return False
-        except Exception as e:
-            logger.error(f"Semgrep verification error: {str(e)}")
-            return False
+    async def verify_token_and_get_user(self, access_token: str) -> dict:
+        """Verify GitLab token and get user info"""
+        async with aiohttp.ClientSession() as session:
+            headers = {'Authorization': f"Bearer {access_token}"}
+            async with session.get(f"{self.gitlab_url}/api/v4/user", headers=headers) as response:
+                if response.status != 200:
+                    raise Exception("Failed to verify token")
+                return await response.json()
 
     async def _clone_repository(self, clone_url: str, temp_dir: Path, default_branch: str) -> bool:
         """Clone repository with memory-efficient settings"""
@@ -131,11 +110,9 @@ class GitLabIntegration:
                 'GIT_HTTP_LOW_SPEED_LIMIT': '1000',
                 'GIT_HTTP_LOW_SPEED_TIME': '10',
                 'GIT_ALLOC_LIMIT': '256M',
-                'GIT_PACK_WINDOW_SIZE': '10',
                 'GIT_PACK_THREADS': '1'
             }
             
-            # Remove the unsafe config options and use simpler clone
             repo = git.Repo.clone_from(
                 clone_url,
                 temp_dir,
@@ -146,7 +123,6 @@ class GitLabIntegration:
             )
             
             return True
-            
         except Exception as e:
             logger.error(f"Clone failed: {str(e)}")
             return False
@@ -156,11 +132,10 @@ class GitLabIntegration:
         try:
             set_memory_limits()
             
-            # Simplified semgrep command with essential options only
             cmd = [
                 "semgrep",
                 "scan",
-                "--config=auto",  #correct config format
+                "--config=auto",
                 "--json",
                 "--max-memory", "256",
                 "--timeout", "30",
@@ -197,7 +172,7 @@ class GitLabIntegration:
             return False, None, str(e)
 
     async def connect_gitlab_account(self, user_id: str, access_token: str) -> dict:
-        """Connect user's GitLab account and trigger scans for their repositories"""
+        """Connect user's GitLab account and trigger scans"""
         session = self.Session()
         try:
             gl = gitlab.Gitlab(self.gitlab_url, oauth_token=access_token)
@@ -278,75 +253,73 @@ class GitLabIntegration:
 
     async def _scan_repository(self, user_id: str, repo_id: int, access_token: str, 
                              gitlab_project_id: int, scan_id: int):
-        """Memory-efficient repository scanning implementation"""
-        logger.info(f"Starting scan {scan_id} for repository {repo_id}")
-        session = self.Session()
-        
-        try:
-            if not await self.verify_semgrep():
-                raise Exception("Semgrep is not properly installed")
-
-            scan = session.query(ScanResult).get(scan_id)
-            if not scan:
-                return
+        """Run repository scan with concurrency control"""
+        async with self.scan_semaphore:
+            logger.info(f"Starting scan {scan_id} for repository {repo_id}")
+            session = self.Session()
             
-            scan.status = ScanStatus.SCANNING
-            session.commit()
-            
-            with tempfile.TemporaryDirectory(prefix='scanner_') as temp_dir_str:
-                temp_dir = Path(temp_dir_str)
-                
-                gl = gitlab.Gitlab(self.gitlab_url, oauth_token=access_token)
-                project = gl.projects.get(gitlab_project_id)
-                
-                clone_url = project.http_url_to_repo.replace(
-                    "https://",
-                    f"https://oauth2:{access_token}@"
-                )
-                
-                if not await self._clone_repository(clone_url, temp_dir, project.default_branch):
-                    raise Exception("Repository clone failed")
-                
-                success, results, error = await self._run_semgrep_scan(temp_dir)
-                
-                if success and results:
-                    findings = results.get('results', [])[:100]
-                    
-                    severity_counts = {'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0}
-                    for finding in findings:
-                        severity = finding.get('extra', {}).get('severity', 'LOW').upper()
-                        severity_counts[severity] += 1
-                    
-                    scan.status = ScanStatus.COMPLETED
-                    scan.findings = findings
-                    scan.findings_count = len(findings)
-                    scan.critical_count = severity_counts['CRITICAL']
-                    scan.high_count = severity_counts['HIGH']
-                    scan.medium_count = severity_counts['MEDIUM']
-                    scan.low_count = severity_counts['LOW']
-                    scan.files_scanned = results.get('stats', {}).get('files_scanned', 0)
-                else:
-                    scan.status = ScanStatus.FAILED
-                    scan.error_message = error
-            
-            repo = session.query(UserRepository).get(repo_id)
-            if repo:
-                repo.last_scan_at = datetime.utcnow()
-            
-            session.commit()
-            
-        except Exception as e:
-            logger.error(f"Scan error: {str(e)}")
             try:
                 scan = session.query(ScanResult).get(scan_id)
-                if scan:
-                    scan.status = ScanStatus.FAILED
-                    scan.error_message = str(e)
-                    session.commit()
-            except Exception as inner_e:
-                logger.error(f"Failed to update scan status: {str(inner_e)}")
-        finally:
-            session.close()
+                if not scan:
+                    return
+                
+                scan.status = ScanStatus.SCANNING
+                session.commit()
+                
+                with tempfile.TemporaryDirectory(prefix='scanner_') as temp_dir_str:
+                    temp_dir = Path(temp_dir_str)
+                    
+                    gl = gitlab.Gitlab(self.gitlab_url, oauth_token=access_token)
+                    project = gl.projects.get(gitlab_project_id)
+                    
+                    clone_url = project.http_url_to_repo.replace(
+                        "https://",
+                        f"https://oauth2:{access_token}@"
+                    )
+                    
+                    if not await self._clone_repository(clone_url, temp_dir, project.default_branch):
+                        raise Exception("Repository clone failed")
+                    
+                    success, results, error = await self._run_semgrep_scan(temp_dir)
+                    
+                    if success and results:
+                        findings = results.get('results', [])[:100]
+                        
+                        severity_counts = {'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0}
+                        for finding in findings:
+                            severity = finding.get('extra', {}).get('severity', 'LOW').upper()
+                            severity_counts[severity] += 1
+                        
+                        scan.status = ScanStatus.COMPLETED
+                        scan.findings = findings
+                        scan.findings_count = len(findings)
+                        scan.critical_count = severity_counts['CRITICAL']
+                        scan.high_count = severity_counts['HIGH']
+                        scan.medium_count = severity_counts['MEDIUM']
+                        scan.low_count = severity_counts['LOW']
+                        scan.files_scanned = results.get('stats', {}).get('files_scanned', 0)
+                    else:
+                        scan.status = ScanStatus.FAILED
+                        scan.error_message = error
+                
+                repo = session.query(UserRepository).get(repo_id)
+                if repo:
+                    repo.last_scan_at = datetime.utcnow()
+                
+                session.commit()
+                
+            except Exception as e:
+                logger.error(f"Scan error: {str(e)}")
+                try:
+                    scan = session.query(ScanResult).get(scan_id)
+                    if scan:
+                        scan.status = ScanStatus.FAILED
+                        scan.error_message = str(e)
+                        session.commit()
+                except Exception as inner_e:
+                    logger.error(f"Failed to update scan status: {str(inner_e)}")
+            finally:
+                session.close()
 
     async def get_user_scan_results(self, user_id: str) -> dict:
         """Get scan results for all user's repositories"""
@@ -425,9 +398,10 @@ class GitLabIntegration:
         finally:
             session.close()
 
-# Flask Application Setup
+# Initialize Flask app with async support
 app = Flask(__name__)
 app.secret_key = os.getenv('FLASK_SECRET_KEY')
+asgi_app = WsgiToAsgi(app)
 
 # GitLab OAuth Configuration
 GITLAB_CLIENT_ID = os.getenv('GITLAB_CLIENT_ID')
@@ -472,18 +446,19 @@ async def gitlab_callback():
     if 'code' not in request.args:
         return jsonify({'error': 'No code provided'}), 400
     
-    token_url = f"{GITLAB_URL}/oauth/token"
-    data = {
-        'client_id': GITLAB_CLIENT_ID,
-        'client_secret': GITLAB_CLIENT_SECRET,
-        'code': request.args['code'],
-        'grant_type': 'authorization_code',
-        'redirect_uri': GITLAB_REDIRECT_URI
-    }
-    
     try:
-        async with aiohttp.ClientSession() as client_session:
-            async with client_session.post(token_url, data=data) as response:
+        async with aiohttp.ClientSession() as session:
+            # Exchange code for token
+            token_url = f"{GITLAB_URL}/oauth/token"
+            data = {
+                'client_id': GITLAB_CLIENT_ID,
+                'client_secret': GITLAB_CLIENT_SECRET,
+                'code': request.args['code'],
+                'grant_type': 'authorization_code',
+                'redirect_uri': GITLAB_REDIRECT_URI
+            }
+            
+            async with session.post(token_url, data=data) as response:
                 token_data = await response.json()
                 
                 if 'error' in token_data:
@@ -496,7 +471,7 @@ async def gitlab_callback():
                 
                 # Get user info
                 headers = {'Authorization': f"Bearer {token_data['access_token']}"}
-                async with client_session.get(f"{GITLAB_URL}/api/v4/user", headers=headers) as user_response:
+                async with session.get(f"{GITLAB_URL}/api/v4/user", headers=headers) as user_response:
                     user_data = await user_response.json()
                     
                     if 'id' not in user_data:
@@ -576,5 +551,5 @@ def health_check():
             'error': str(e)
         }), 500
 
-if __name__ == '__main__':
-    app.run(debug=False)
+# Create ASGI app
+asgi_app = WsgiToAsgi(app)
