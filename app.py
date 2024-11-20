@@ -12,6 +12,7 @@ import aiohttp
 from pathlib import Path
 import json
 import git
+import signal 
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey, Enum, Float, Text, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, sessionmaker
@@ -446,8 +447,8 @@ async def gitlab_callback():
     if 'code' not in request.args:
         return jsonify({'error': 'No code provided'}), 400
     
-    try:
-        async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession() as session:
+        try:
             # Exchange code for token
             token_url = f"{GITLAB_URL}/oauth/token"
             data = {
@@ -469,8 +470,10 @@ async def gitlab_callback():
                     logger.error(f"No access token in response: {token_data}")
                     return jsonify({'error': 'No access token received'}), 400
                 
+                access_token = token_data['access_token']
+                
                 # Get user info
-                headers = {'Authorization': f"Bearer {token_data['access_token']}"}
+                headers = {'Authorization': f"Bearer {access_token}"}
                 async with session.get(f"{GITLAB_URL}/api/v4/user", headers=headers) as user_response:
                     user_data = await user_response.json()
                     
@@ -479,31 +482,24 @@ async def gitlab_callback():
                         return jsonify({'error': 'Failed to get user info'}), 400
                     
                     # Store in session
-                    session['gitlab_token'] = token_data['access_token']
+                    session['gitlab_token'] = access_token
                     session['gitlab_user_id'] = user_data['id']
                     
-                    try:
-                        # Start repository scanning
-                        scan_result = await gitlab_integration.connect_gitlab_account(
-                            user_id=str(user_data['id']),
-                            access_token=token_data['access_token']
-                        )
-                        
-                        return jsonify({
-                            'success': True,
-                            'message': 'Successfully connected GitLab account',
-                            'scan_initiated': scan_result
-                        })
-                    except Exception as e:
-                        logger.error(f"Repository scan error: {str(e)}")
-                        return jsonify({
-                            'success': False,
-                            'error': 'Connected to GitLab but failed to scan repositories'
-                        }), 500
+                    # Start repository scanning
+                    scan_result = await gitlab_integration.connect_gitlab_account(
+                        user_id=str(user_data['id']),
+                        access_token=access_token
+                    )
                     
-    except Exception as e:
-        logger.error(f"OAuth error: {str(e)}")
-        return jsonify({'error': 'OAuth process failed'}), 500
+                    return jsonify({
+                        'success': True,
+                        'message': 'Successfully connected GitLab account',
+                        'scan_initiated': scan_result
+                    })
+                    
+        except Exception as e:
+            logger.error(f"OAuth error: {str(e)}")
+            return jsonify({'error': 'OAuth process failed'}), 500
 
 @app.route('/api/gitlab/repos')
 @requires_auth
@@ -550,6 +546,27 @@ def health_check():
             'status': 'unhealthy',
             'error': str(e)
         }), 500
+    
+
+
+def handle_sigterm(signum, frame):
+    """Handle SIGTERM signal gracefully"""
+    logger.info("Received SIGTERM. Performing graceful shutdown...")
+    # Cancel any pending tasks
+    for task in asyncio.all_tasks():
+        task.cancel()
+    sys.exit(0)
+
+# Register signal handler
+signal.signal(signal.SIGTERM, handle_sigterm)
+
+def worker_exit(server, worker):
+    """Cleanup when worker exits"""
+    logger.info("Worker shutting down...")
+    # Cancel any pending tasks
+    loop = asyncio.get_event_loop()
+    for task in asyncio.all_tasks(loop):
+        task.cancel()
 
 # Create ASGI app
 asgi_app = WsgiToAsgi(app)
