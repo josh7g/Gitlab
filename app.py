@@ -21,6 +21,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 import enum
 import gitlab
 from asgiref.wsgi import WsgiToAsgi
+from flask.json.provider import JSONProvider
 
 # Configure logging
 logging.basicConfig(
@@ -447,60 +448,63 @@ async def gitlab_callback():
     
     if 'code' not in request.args:
         return jsonify({'error': 'No code provided'}), 400
-    
-    async with aiohttp.ClientSession() as session:
-        try:
-            # Exchange code for token
-            token_url = f"{GITLAB_URL}/oauth/token"
-            data = {
-                'client_id': GITLAB_CLIENT_ID,
-                'client_secret': GITLAB_CLIENT_SECRET,
-                'code': request.args['code'],
-                'grant_type': 'authorization_code',
-                'redirect_uri': GITLAB_REDIRECT_URI
-            }
-            
-            async with session.post(token_url, data=data) as response:
-                token_data = await response.json()
+
+    try:
+        token_url = f"{GITLAB_URL}/oauth/token"
+        token_data = {
+            'client_id': GITLAB_CLIENT_ID,
+            'client_secret': GITLAB_CLIENT_SECRET,
+            'code': request.args['code'],
+            'grant_type': 'authorization_code',
+            'redirect_uri': GITLAB_REDIRECT_URI
+        }
+        
+        async with aiohttp.ClientSession() as client:
+            # Get access token
+            async with client.post(token_url, data=token_data) as token_response:
+                token_result = await token_response.json()
                 
-                if 'error' in token_data:
-                    logger.error(f"GitLab OAuth error: {token_data['error']}")
-                    return jsonify({'error': token_data['error']}), 400
+                if 'error' in token_result:
+                    logger.error(f"GitLab OAuth error: {token_result['error']}")
+                    return jsonify({'error': token_result['error']}), 400
                 
-                if 'access_token' not in token_data:
-                    logger.error(f"No access token in response: {token_data}")
+                if 'access_token' not in token_result:
+                    logger.error(f"No access token in response: {token_result}")
                     return jsonify({'error': 'No access token received'}), 400
                 
-                access_token = token_data['access_token']
+                access_token = token_result['access_token']
+            
+            # Get user info
+            user_url = f"{GITLAB_URL}/api/v4/user"
+            headers = {'Authorization': f"Bearer {access_token}"}
+            
+            async with client.get(user_url, headers=headers) as user_response:
+                user_data = await user_response.json()
                 
-                # Get user info
-                headers = {'Authorization': f"Bearer {access_token}"}
-                async with session.get(f"{GITLAB_URL}/api/v4/user", headers=headers) as user_response:
-                    user_data = await user_response.json()
-                    
-                    if 'id' not in user_data:
-                        logger.error(f"Invalid user data response: {user_data}")
-                        return jsonify({'error': 'Failed to get user info'}), 400
-                    
-                    # Store in session
-                    session['gitlab_token'] = access_token
-                    session['gitlab_user_id'] = user_data['id']
-                    
-                    # Start repository scanning
-                    scan_result = await gitlab_integration.connect_gitlab_account(
-                        user_id=str(user_data['id']),
-                        access_token=access_token
-                    )
-                    
-                    return jsonify({
-                        'success': True,
-                        'message': 'Successfully connected GitLab account',
-                        'scan_initiated': scan_result
-                    })
-                    
-        except Exception as e:
-            logger.error(f"OAuth error: {str(e)}")
-            return jsonify({'error': 'OAuth process failed'}), 500
+                if 'id' not in user_data:
+                    logger.error(f"Invalid user data response: {user_data}")
+                    return jsonify({'error': 'Failed to get user info'}), 400
+                
+                # Store in session
+                flask_session = session._get_current_object()
+                flask_session['gitlab_token'] = access_token
+                flask_session['gitlab_user_id'] = user_data['id']
+                
+                # Start repository scanning
+                scan_result = await gitlab_integration.connect_gitlab_account(
+                    user_id=str(user_data['id']),
+                    access_token=access_token
+                )
+                
+                return jsonify({
+                    'success': True,
+                    'message': 'Successfully connected GitLab account',
+                    'scan_initiated': scan_result
+                })
+                
+    except Exception as e:
+        logger.error(f"OAuth error: {str(e)}")
+        return jsonify({'error': 'OAuth process failed'}), 500
 
 @app.route('/api/gitlab/repos')
 @requires_auth
@@ -570,6 +574,21 @@ def handle_sigterm(signum, frame):
 
 # Register signal handler
 signal.signal(signal.SIGTERM, handle_sigterm)
+
+
+app = Flask(__name__)
+app.secret_key = os.getenv('FLASK_SECRET_KEY')
+
+# Enable session interface for async support
+
+class CustomJSONProvider(JSONProvider):
+    def dumps(self, obj, **kwargs):
+        return json.dumps(obj, default=str)
+    
+    def loads(self, s, **kwargs):
+        return json.loads(s)
+
+app.json = CustomJSONProvider(app)
 
 # Create ASGI app
 asgi_app = WsgiToAsgi(app)
