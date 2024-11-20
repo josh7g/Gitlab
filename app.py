@@ -135,20 +135,16 @@ class GitLabIntegration:
                 'GIT_PACK_THREADS': '1'
             }
             
+            # Remove the unsafe config options and use simpler clone
             repo = git.Repo.clone_from(
                 clone_url,
                 temp_dir,
                 depth=1,
                 branch=default_branch,
                 single_branch=True,
-                filter=['blob:none'],
-                env=git_env,
-                no_checkout=True,
-                shallow_submodules=True,
-                config=['core.compression=0', 'pack.windowMemory=100m']
+                env=git_env
             )
             
-            repo.git.checkout(default_branch)
             return True
             
         except Exception as e:
@@ -160,18 +156,14 @@ class GitLabIntegration:
         try:
             set_memory_limits()
             
+            # Simplified semgrep command with essential options only
             cmd = [
                 "semgrep",
                 "scan",
-                "--config", "auto",
+                "--config=auto",  #correct config format
                 "--json",
-                "--quiet",
-                "--timeout", "30",
                 "--max-memory", "256",
-                "--jobs", "1",
-                "--max-target-bytes", "50000",
-                "--max-files", "100",
-                "--timeout-threshold", "3",
+                "--timeout", "30",
                 str(temp_dir)
             ]
             
