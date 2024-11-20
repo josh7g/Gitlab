@@ -1,25 +1,23 @@
 from flask import Flask, request, redirect, jsonify, session
 import os
 from functools import wraps
-import requests
 from datetime import datetime
 import logging
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, JSON, ForeignKey, Enum, Float, Text, Boolean
+import sys
+import resource
+import tempfile
+import shutil
+import asyncio
+import aiohttp
+from pathlib import Path
+import json
+import git
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey, Enum, Float, Text, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, sessionmaker
 from sqlalchemy.dialects.postgresql import JSONB
 import enum
 import gitlab
-from typing import Dict, Optional
-import asyncio
-import aiohttp  
-from pathlib import Path
-import tempfile
-import shutil
-import logging
-import sys
-import resource
-
 
 # Configure logging
 logging.basicConfig(
@@ -93,15 +91,119 @@ class ScanResult(Base):
     # Relationship
     repository = relationship("UserRepository", back_populates="scan_results")
 
-# GitLab Integration Class
+def set_memory_limits():
+    """Set process memory limits"""
+    mem_limit = 256 * 1024 * 1024  # 256MB in bytes
+    try:
+        resource.setrlimit(resource.RLIMIT_AS, (mem_limit, resource.RLIM_INFINITY))
+    except Exception as e:
+        logger.warning(f"Could not set memory limits: {e}")
+
 class GitLabIntegration:
     def __init__(self, database_url: str, gitlab_url: str = "https://gitlab.com"):
         self.engine = create_engine(database_url)
         Base.metadata.create_all(self.engine)
         self.Session = sessionmaker(bind=self.engine)
         self.gitlab_url = gitlab_url
-    
-    
+
+    @staticmethod
+    async def verify_semgrep():
+        """Verify semgrep is installed and working"""
+        try:
+            import subprocess
+            result = subprocess.run(['semgrep', '--version'], 
+                                  capture_output=True, 
+                                  text=True)
+            if result.returncode == 0:
+                logger.info(f"Semgrep verified: {result.stdout.strip()}")
+                return True
+            else:
+                logger.error(f"Semgrep check failed: {result.stderr}")
+                return False
+        except Exception as e:
+            logger.error(f"Semgrep verification error: {str(e)}")
+            return False
+
+    async def _clone_repository(self, clone_url: str, temp_dir: Path, default_branch: str) -> bool:
+        """Clone repository with memory-efficient settings"""
+        try:
+            git_env = {
+                'GIT_HTTP_LOW_SPEED_LIMIT': '1000',
+                'GIT_HTTP_LOW_SPEED_TIME': '10',
+                'GIT_ALLOC_LIMIT': '256M',
+                'GIT_PACK_WINDOW_SIZE': '10',
+                'GIT_PACK_THREADS': '1'
+            }
+            
+            repo = git.Repo.clone_from(
+                clone_url,
+                temp_dir,
+                depth=1,
+                branch=default_branch,
+                single_branch=True,
+                filter=['blob:none'],
+                env=git_env,
+                no_checkout=True,
+                shallow_submodules=True,
+                config=['core.compression=0', 'pack.windowMemory=100m']
+            )
+            
+            repo.git.checkout(default_branch)
+            return True
+            
+        except Exception as e:
+            logger.error(f"Clone failed: {str(e)}")
+            return False
+
+    async def _run_semgrep_scan(self, temp_dir: Path) -> tuple:
+        """Run Semgrep scan with memory constraints"""
+        try:
+            set_memory_limits()
+            
+            cmd = [
+                "semgrep",
+                "scan",
+                "--config", "auto",
+                "--json",
+                "--quiet",
+                "--timeout", "30",
+                "--max-memory", "256",
+                "--jobs", "1",
+                "--max-target-bytes", "50000",
+                "--max-files", "100",
+                "--timeout-threshold", "3",
+                str(temp_dir)
+            ]
+            
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                limit=256 * 1024 * 1024
+            )
+            
+            try:
+                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=60)
+            except asyncio.TimeoutError:
+                if process:
+                    try:
+                        process.kill()
+                    except:
+                        pass
+                return False, None, "Scan timeout exceeded"
+            
+            if process.returncode == 0:
+                try:
+                    results = json.loads(stdout)
+                    return True, results, None
+                except json.JSONDecodeError as e:
+                    return False, None, f"Failed to parse Semgrep output: {str(e)}"
+            else:
+                return False, None, stderr.decode()
+                
+        except Exception as e:
+            return False, None, str(e)
+
     async def connect_gitlab_account(self, user_id: str, access_token: str) -> dict:
         """Connect user's GitLab account and trigger scans for their repositories"""
         session = self.Session()
@@ -114,7 +216,6 @@ class GitLabIntegration:
             
             for project in projects:
                 try:
-                    # Check if repository exists
                     existing_repo = session.query(UserRepository).filter_by(
                         user_id=user_id,
                         gitlab_project_id=project.id
@@ -135,9 +236,8 @@ class GitLabIntegration:
                             size_mb=project.statistics()['repository_size'] / 1024 / 1024 if hasattr(project, 'statistics') else 0
                         )
                         session.add(repo)
-                        session.flush()  # Flush to get the repo ID
+                        session.flush()
                     
-                    # Create and persist scan record before creating the task
                     scan = ScanResult(
                         repository_id=repo.id,
                         user_id=user_id,
@@ -146,18 +246,17 @@ class GitLabIntegration:
                         scan_date=datetime.utcnow()
                     )
                     session.add(scan)
-                    session.flush()  # Flush to get the scan ID
+                    session.flush()
                     
                     processed_repos.append({
                         'id': repo.id,
                         'name': project.name,
                         'url': project.web_url,
-                        'scan_id': scan.id  # Include scan ID in response
+                        'scan_id': scan.id
                     })
                     
                     logger.info(f"Created scan {scan.id} for repository {repo.id}")
                     
-                    # Only create scan task if we have a valid scan ID
                     if scan.id:
                         asyncio.create_task(self._scan_repository(
                             user_id=user_id,
@@ -166,8 +265,6 @@ class GitLabIntegration:
                             gitlab_project_id=project.id,
                             scan_id=scan.id
                         ))
-                    else:
-                        logger.error(f"Failed to get scan ID for repository {repo.id}")
                     
                 except Exception as e:
                     logger.error(f"Error processing repository {project.name}: {str(e)}")
@@ -186,7 +283,79 @@ class GitLabIntegration:
             raise
         finally:
             session.close()
-    
+
+    async def _scan_repository(self, user_id: str, repo_id: int, access_token: str, 
+                             gitlab_project_id: int, scan_id: int):
+        """Memory-efficient repository scanning implementation"""
+        logger.info(f"Starting scan {scan_id} for repository {repo_id}")
+        session = self.Session()
+        
+        try:
+            if not await self.verify_semgrep():
+                raise Exception("Semgrep is not properly installed")
+
+            scan = session.query(ScanResult).get(scan_id)
+            if not scan:
+                return
+            
+            scan.status = ScanStatus.SCANNING
+            session.commit()
+            
+            with tempfile.TemporaryDirectory(prefix='scanner_') as temp_dir_str:
+                temp_dir = Path(temp_dir_str)
+                
+                gl = gitlab.Gitlab(self.gitlab_url, oauth_token=access_token)
+                project = gl.projects.get(gitlab_project_id)
+                
+                clone_url = project.http_url_to_repo.replace(
+                    "https://",
+                    f"https://oauth2:{access_token}@"
+                )
+                
+                if not await self._clone_repository(clone_url, temp_dir, project.default_branch):
+                    raise Exception("Repository clone failed")
+                
+                success, results, error = await self._run_semgrep_scan(temp_dir)
+                
+                if success and results:
+                    findings = results.get('results', [])[:100]
+                    
+                    severity_counts = {'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0}
+                    for finding in findings:
+                        severity = finding.get('extra', {}).get('severity', 'LOW').upper()
+                        severity_counts[severity] += 1
+                    
+                    scan.status = ScanStatus.COMPLETED
+                    scan.findings = findings
+                    scan.findings_count = len(findings)
+                    scan.critical_count = severity_counts['CRITICAL']
+                    scan.high_count = severity_counts['HIGH']
+                    scan.medium_count = severity_counts['MEDIUM']
+                    scan.low_count = severity_counts['LOW']
+                    scan.files_scanned = results.get('stats', {}).get('files_scanned', 0)
+                else:
+                    scan.status = ScanStatus.FAILED
+                    scan.error_message = error
+            
+            repo = session.query(UserRepository).get(repo_id)
+            if repo:
+                repo.last_scan_at = datetime.utcnow()
+            
+            session.commit()
+            
+        except Exception as e:
+            logger.error(f"Scan error: {str(e)}")
+            try:
+                scan = session.query(ScanResult).get(scan_id)
+                if scan:
+                    scan.status = ScanStatus.FAILED
+                    scan.error_message = str(e)
+                    session.commit()
+            except Exception as inner_e:
+                logger.error(f"Failed to update scan status: {str(inner_e)}")
+        finally:
+            session.close()
+
     async def get_user_scan_results(self, user_id: str) -> dict:
         """Get scan results for all user's repositories"""
         session = self.Session()
@@ -246,166 +415,6 @@ class GitLabIntegration:
         finally:
             session.close()
 
-    @staticmethod
-    async def verify_semgrep():
-        """Verify semgrep is installed and working"""
-        try:
-            import subprocess
-            result = subprocess.run(['semgrep', '--version'], 
-                                    capture_output=True, 
-                                    text=True)
-            if result.returncode == 0:
-                logger.info(f"Semgrep verified: {result.stdout.strip()}")
-                return True
-            else:
-                logger.error(f"Semgrep check failed: {result.stderr}")
-                return False
-        except Exception as e:
-            logger.error(f"Semgrep verification error: {str(e)}")
-            return False
-
-
-
-    async def _scan_repository(self, user_id: str, repo_id: int, access_token: str, 
-                    gitlab_project_id: int, scan_id: int):
-        """Run Semgrep scan on a repository and store results"""
-        logger.info(f"Starting scan {scan_id} for repository {repo_id}")
-        session = self.Session()
-        temp_dir = None
-        process = None
-        
-        try:
-            if not await self.verify_semgrep():
-                raise Exception("Semgrep is not properly installed")
-
-            import resource
-            resource.setrlimit(resource.RLIMIT_AS, (256 * 1024 * 1024, -1))
-
-            scan = session.query(ScanResult).get(scan_id)
-            if not scan:
-                logger.error(f"Could not find scan with ID {scan_id}")
-                return
-            
-            scan.status = ScanStatus.SCANNING
-            session.commit()
-            
-            gl = gitlab.Gitlab(self.gitlab_url, oauth_token=access_token)
-            project = gl.projects.get(gitlab_project_id)
-                    
-            temp_dir = Path(tempfile.mkdtemp(prefix='scanner_'))
-            clone_url = project.http_url_to_repo.replace(
-                "https://",
-                f"https://oauth2:{access_token}@"
-            )
-            
-            try:
-                import git
-                repo = git.Repo.clone_from(
-                    clone_url,
-                    temp_dir,
-                    depth=1,
-                    branch=project.default_branch,
-                    single_branch=True,
-                    filter=['blob:none'],
-                    env={'GIT_HTTP_LOW_SPEED_LIMIT': '1000', 
-                            'GIT_HTTP_LOW_SPEED_TIME': '10'}
-                )
-                
-                cmd = [
-                    "semgrep",
-                    "scan",
-                    "--config", "auto",
-                    "--json",
-                    "--quiet",
-                    "--timeout", "10",
-                    "--max-memory", "64",
-                    "--jobs", "1", 
-                    "--max-target-bytes", "100000",
-                    "--max-files", "500",
-                    "--timeout-threshold", "2",
-                    str(temp_dir)
-                ]
-                
-                start_time = datetime.now()
-                process = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                
-                try:
-                    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30)
-                    duration = (datetime.now() - start_time).total_seconds()
-                    
-                    if process.returncode == 0:
-                        import json
-                        results = json.loads(stdout)
-                        findings = results.get('results', [])[:100]
-                        
-                        severity_counts = {'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0}
-                        for finding in findings:
-                            severity = finding.get('extra', {}).get('severity', 'LOW').upper()
-                            severity_counts[severity] += 1
-                        
-                        session.refresh(scan)
-                        scan.status = ScanStatus.COMPLETED
-                        scan.findings = findings
-                        scan.findings_count = len(findings)
-                        scan.critical_count = severity_counts['CRITICAL']
-                        scan.high_count = severity_counts['HIGH']
-                        scan.medium_count = severity_counts['MEDIUM']
-                        scan.low_count = severity_counts['LOW']
-                        scan.duration_seconds = duration
-                        scan.files_scanned = results.get('stats', {}).get('files_scanned', 0)
-                        
-                    else:
-                        session.refresh(scan)
-                        scan.status = ScanStatus.FAILED
-                        scan.error_message = stderr.decode()
-                        
-                except asyncio.TimeoutError:
-                    session.refresh(scan)
-                    scan.status = ScanStatus.FAILED
-                    scan.error_message = "Scan timeout exceeded"
-                    
-            except Exception as e:
-                session.refresh(scan)
-                scan.status = ScanStatus.FAILED
-                scan.error_message = str(e)
-                logger.error(f"Error during repository scan: {str(e)}")
-            
-            repo = session.query(UserRepository).get(repo_id)
-            if repo:
-                repo.last_scan_at = datetime.utcnow()
-            
-            session.commit()
-            
-        except Exception as e:
-            logger.error(f"Error scanning repository {repo_id}: {str(e)}")
-            try:
-                scan = session.query(ScanResult).get(scan_id)
-                if scan:
-                    scan.status = ScanStatus.FAILED
-                    scan.error_message = str(e)
-                    session.commit()
-            except Exception as inner_e:
-                logger.error(f"Failed to update scan status: {str(inner_e)}")
-                
-        finally:
-            if process:
-                try:
-                    process.kill()
-                except:
-                    pass
-                    
-            if temp_dir and temp_dir.exists():
-                try:
-                    shutil.rmtree(temp_dir)
-                except Exception as e:
-                    logger.error(f"Failed to cleanup temp directory: {str(e)}")
-                    
-            session.close()
-    
     async def get_scan_status(self, scan_id: int) -> dict:
         """Get the current status of a scan"""
         session = self.Session()
@@ -424,11 +433,11 @@ class GitLabIntegration:
         finally:
             session.close()
 
-# Flask Application
+# Flask Application Setup
 app = Flask(__name__)
 app.secret_key = os.getenv('FLASK_SECRET_KEY')
 
-# GitLab OAuth settings
+# GitLab OAuth Configuration
 GITLAB_CLIENT_ID = os.getenv('GITLAB_CLIENT_ID')
 GITLAB_CLIENT_SECRET = os.getenv('GITLAB_CLIENT_SECRET')
 GITLAB_REDIRECT_URI = os.getenv('GITLAB_REDIRECT_URI')
@@ -441,6 +450,7 @@ gitlab_integration = GitLabIntegration(
 )
 
 def requires_auth(f):
+    """Authentication decorator for routes"""
     @wraps(f)
     def decorated(*args, **kwargs):
         if 'gitlab_token' not in session:
@@ -470,7 +480,6 @@ async def gitlab_callback():
     if 'code' not in request.args:
         return jsonify({'error': 'No code provided'}), 400
     
-    # Exchange code for access token
     token_url = f"{GITLAB_URL}/oauth/token"
     data = {
         'client_id': GITLAB_CLIENT_ID,
@@ -502,12 +511,12 @@ async def gitlab_callback():
                         logger.error(f"Invalid user data response: {user_data}")
                         return jsonify({'error': 'Failed to get user info'}), 400
                     
-                    # Store in flask session
+                    # Store in session
                     session['gitlab_token'] = token_data['access_token']
                     session['gitlab_user_id'] = user_data['id']
                     
                     try:
-                        # Start scanning repositories
+                        # Start repository scanning
                         scan_result = await gitlab_integration.connect_gitlab_account(
                             user_id=str(user_data['id']),
                             access_token=token_data['access_token']
@@ -528,7 +537,7 @@ async def gitlab_callback():
     except Exception as e:
         logger.error(f"OAuth error: {str(e)}")
         return jsonify({'error': 'OAuth process failed'}), 500
-    
+
 @app.route('/api/gitlab/repos')
 @requires_auth
 async def list_repos():
@@ -551,18 +560,22 @@ async def get_scan_status(scan_id):
 
 @app.route('/health')
 def health_check():
-    """Health check endpoint that also verifies semgrep installation"""
+    """Health check endpoint"""
     try:
-        # Check if semgrep is installed and accessible
+        # Verify semgrep installation
         import subprocess
         result = subprocess.run(['semgrep', '--version'], 
                               capture_output=True, 
                               text=True)
-        semgrep_version = result.stdout.strip()
+        
+        # Check database connection
+        with gitlab_integration.Session() as session:
+            session.execute('SELECT 1')
         
         return jsonify({
             'status': 'healthy',
-            'semgrep_version': semgrep_version
+            'semgrep_version': result.stdout.strip(),
+            'database': 'connected'
         })
     except Exception as e:
         logger.error(f"Health check failed: {str(e)}")
@@ -570,3 +583,6 @@ def health_check():
             'status': 'unhealthy',
             'error': str(e)
         }), 500
+
+if __name__ == '__main__':
+    app.run(debug=False)
