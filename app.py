@@ -23,6 +23,22 @@ import gitlab
 from asgiref.wsgi import WsgiToAsgi
 from flask.json.provider import JSONProvider
 
+app = Flask(__name__)
+app.secret_key = os.getenv('FLASK_SECRET_KEY')
+
+# Enable session interface for async support
+class CustomJSONProvider(JSONProvider):
+    def dumps(self, obj, **kwargs):
+        return json.dumps(obj, default=str)
+    
+    def loads(self, s, **kwargs):
+        return json.loads(s)
+
+app.json = CustomJSONProvider(app)
+
+# Create ASGI app
+asgi_app = WsgiToAsgi(app)
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -556,39 +572,41 @@ def cleanup():
     """Cleanup function to be called on shutdown"""
     logger.info("Application shutting down...")
     try:
-        loop = asyncio.get_event_loop()
-        tasks = asyncio.all_tasks(loop)
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        tasks = asyncio.all_tasks(loop) if hasattr(asyncio, 'all_tasks') else set()
         for task in tasks:
             task.cancel()
+            
+        if loop.is_running():
+            loop.stop()
+            
     except Exception as e:
         logger.error(f"Error during cleanup: {e}")
-atexit.register(cleanup)
 
+# Update signal handler as well
 def handle_sigterm(signum, frame):
     """Handle SIGTERM signal gracefully"""
     logger.info("Received SIGTERM. Performing graceful shutdown...")
-    # Cancel any pending tasks
-    for task in asyncio.all_tasks():
-        task.cancel()
-    sys.exit(0)
-
-# Register signal handler
-signal.signal(signal.SIGTERM, handle_sigterm)
-
-
-app = Flask(__name__)
-app.secret_key = os.getenv('FLASK_SECRET_KEY')
-
-# Enable session interface for async support
-
-class CustomJSONProvider(JSONProvider):
-    def dumps(self, obj, **kwargs):
-        return json.dumps(obj, default=str)
+    try:
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        tasks = asyncio.all_tasks(loop) if hasattr(asyncio, 'all_tasks') else set()
+        for task in tasks:
+            task.cancel()
+            
+        if loop.is_running():
+            loop.stop()
+            
+    except Exception as e:
+        logger.error(f"Error during cleanup: {e}")
     
-    def loads(self, s, **kwargs):
-        return json.loads(s)
-
-app.json = CustomJSONProvider(app)
-
-# Create ASGI app
-asgi_app = WsgiToAsgi(app)
+    sys.exit(0)
