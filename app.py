@@ -17,6 +17,9 @@ import structlog
 import os
 from typing import Optional, List, Dict, Any
 from pydantic import BaseModel
+import git
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 # Configure logging
 logger = structlog.get_logger()
@@ -149,69 +152,51 @@ db = AsyncDatabaseSession()
 # GitLab Integration
 class GitLabIntegration:
     def __init__(self):
-        self.scan_semaphore = asyncio.Semaphore(SCAN_CONCURRENCY)
+        self.scan_semaphore = asyncio.Semaphore(2)
         self._session = aiohttp.ClientSession()
+        self.executor = ThreadPoolExecutor(max_workers=4)
 
     async def close(self):
         if self._session:
             await self._session.close()
+        self.executor.shutdown(wait=True)
 
-    async def verify_token(self, access_token: str) -> UserData:
-        async with self._session.get(
-            f"{GITLAB_URL}/api/v4/user",
-            headers={"Authorization": f"Bearer {access_token}"}
-        ) as response:
-            if response.status != 200:
-                raise HTTPException(status_code=401, detail="Invalid token")
-            data = await response.json()
-            return UserData(**data)
-
-    async def clone_repository(self, clone_url: str, temp_dir: Path, default_branch: str) -> bool:
+    def _clone_repo_sync(self, clone_url: str, temp_dir: str, default_branch: str) -> bool:
+        """Synchronous repository cloning using GitPython"""
         try:
-            repo = await aiogit.clone(
+            git.Repo.clone_from(
                 clone_url,
                 temp_dir,
                 branch=default_branch,
                 depth=1,
-                single_branch=True
+                single_branch=True,
+                env={
+                    'GIT_HTTP_LOW_SPEED_LIMIT': '1000',
+                    'GIT_HTTP_LOW_SPEED_TIME': '10',
+                    'GIT_ALLOC_LIMIT': '256M',
+                    'GIT_PACK_THREADS': '1'
+                }
             )
             return True
         except Exception as e:
             logger.error("clone_failed", error=str(e))
             return False
 
-    async def run_semgrep_scan(self, temp_dir: Path) -> tuple[bool, Optional[dict], Optional[str]]:
+    async def clone_repository(self, clone_url: str, temp_dir: str, default_branch: str) -> bool:
+        """Asynchronous wrapper for repository cloning"""
         try:
-            # Set process memory limits
-            resource.setrlimit(resource.RLIMIT_AS, (MEMORY_LIMIT_MB * 1024 * 1024, resource.RLIM_INFINITY))
-            
-            process = await asyncio.create_subprocess_exec(
-                "semgrep",
-                "scan",
-                "--config=auto",
-                "--json",
-                "--max-memory", str(MEMORY_LIMIT_MB),
-                "--timeout", "30",
-                str(temp_dir),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                self.executor,
+                self._clone_repo_sync,
+                clone_url,
+                temp_dir,
+                default_branch
             )
-            
-            try:
-                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=60)
-                if process.returncode == 0:
-                    results = json.loads(stdout)
-                    return True, results, None
-                return False, None, stderr.decode()
-            except asyncio.TimeoutError:
-                if process:
-                    try:
-                        process.kill()
-                    except:
-                        pass
-                return False, None, "Scan timeout exceeded"
+            return result
         except Exception as e:
-            return False, None, str(e)
+            logger.error("async_clone_failed", error=str(e))
+            return False
 
     async def scan_repository(
         self,
@@ -225,16 +210,13 @@ class GitLabIntegration:
             logger.info("scan_started", scan_id=scan_id, repo_id=repo_id)
             
             try:
-                # Update scan status
                 async with db._session.begin():
                     scan = await db._session.get(ScanResult, scan_id)
                     if not scan:
                         return
                     scan.status = ScanStatus.SCANNING
                 
-                with tempfile.TemporaryDirectory(prefix='scanner_') as temp_dir_str:
-                    temp_dir = Path(temp_dir_str)
-                    
+                with tempfile.TemporaryDirectory(prefix='scanner_') as temp_dir:
                     # Get repository info from GitLab
                     async with self._session.get(
                         f"{GITLAB_URL}/api/v4/projects/{gitlab_project_id}",
