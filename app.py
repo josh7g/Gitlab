@@ -12,7 +12,8 @@ import aiohttp
 from pathlib import Path
 import json
 import git
-import signal 
+import signal
+import atexit
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey, Enum, Float, Text, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, sessionmaker
@@ -547,7 +548,17 @@ def health_check():
             'error': str(e)
         }), 500
     
-
+def cleanup():
+    """Cleanup function to be called on shutdown"""
+    logger.info("Application shutting down...")
+    try:
+        loop = asyncio.get_event_loop()
+        tasks = asyncio.all_tasks(loop)
+        for task in tasks:
+            task.cancel()
+    except Exception as e:
+        logger.error(f"Error during cleanup: {e}")
+atexit.register(cleanup)
 
 def handle_sigterm(signum, frame):
     """Handle SIGTERM signal gracefully"""
@@ -559,14 +570,6 @@ def handle_sigterm(signum, frame):
 
 # Register signal handler
 signal.signal(signal.SIGTERM, handle_sigterm)
-
-def worker_exit(server, worker):
-    """Cleanup when worker exits"""
-    logger.info("Worker shutting down...")
-    # Cancel any pending tasks
-    loop = asyncio.get_event_loop()
-    for task in asyncio.all_tasks(loop):
-        task.cancel()
 
 # Create ASGI app
 asgi_app = WsgiToAsgi(app)
