@@ -10,7 +10,6 @@ from sqlalchemy.orm import relationship
 from datetime import datetime
 import resource
 import tempfile
-import asyncio
 import signal
 import enum
 import logging
