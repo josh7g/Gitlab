@@ -1,7 +1,15 @@
-from flask import Flask, request, redirect, jsonify, session
-import os
-from functools import wraps
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse, JSONResponse
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Enum, Float, Text, Boolean, select
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import relationship
+from sqlalchemy.pool import AsyncAdapterPool
 from datetime import datetime
+import enum
 import logging
 import sys
 import resource
@@ -11,48 +19,36 @@ import asyncio
 import aiohttp
 from pathlib import Path
 import json
-import git
+import aiogit
 import signal
-import atexit
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey, Enum, Float, Text, Boolean
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import relationship, sessionmaker
-from sqlalchemy.dialects.postgresql import JSONB
-import enum
-import gitlab
-from asgiref.wsgi import WsgiToAsgi
-from flask.json.provider import JSONProvider
+from typing import Optional, List, Dict, Any
+import os
+from pydantic import BaseModel, Field
+import uvicorn
+from contextlib import asynccontextmanager
 
-app = Flask(__name__)
-app.secret_key = os.getenv('FLASK_SECRET_KEY')
+# Configure logging with structlog for better output
+import structlog
 
-# Enable session interface for async support
-class CustomJSONProvider(JSONProvider):
-    def dumps(self, obj, **kwargs):
-        return json.dumps(obj, default=str)
-    
-    def loads(self, s, **kwargs):
-        return json.loads(s)
+logger = structlog.get_logger()
+logging.basicConfig(level=logging.INFO)
 
-app.json = CustomJSONProvider(app)
+# Constants
+MEMORY_LIMIT_MB = 256
+SCAN_CONCURRENCY = 2
+GITLAB_URL = os.getenv('GITLAB_URL', 'https://gitlab.com')
+GITLAB_CLIENT_ID = os.getenv('GITLAB_CLIENT_ID')
+GITLAB_CLIENT_SECRET = os.getenv('GITLAB_CLIENT_SECRET')
+GITLAB_REDIRECT_URI = os.getenv('GITLAB_REDIRECT_URI')
+DATABASE_URL = os.getenv('DATABASE_URL')
 
-# Create ASGI app
-asgi_app = WsgiToAsgi(app)
+# Convert SQLAlchemy URL to async
+ASYNC_DATABASE_URL = DATABASE_URL.replace('postgresql://', 'postgresql+asyncpg://')
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger(__name__)
-
-# Initialize SQLAlchemy
+# Models
 Base = declarative_base()
 
-class ScanStatus(enum.Enum):
+class ScanStatus(str, enum.Enum):
     PENDING = "pending"
     SCANNING = "scanning"
     COMPLETED = "completed"
@@ -90,86 +86,130 @@ class ScanResult(Base):
     medium_count = Column(Integer, default=0)
     low_count = Column(Integer, default=0)
     findings = Column(JSONB)
-    error_message = Column(Text, nullable=True)
+    error_message = Column(Text)
     duration_seconds = Column(Float)
     files_scanned = Column(Integer)
     files_skipped = Column(Integer)
     repository = relationship("UserRepository", back_populates="scan_results")
 
-def set_memory_limits():
-    """Set process memory limits"""
-    mem_limit = 256 * 1024 * 1024  # 256MB
-    try:
-        resource.setrlimit(resource.RLIMIT_AS, (mem_limit, resource.RLIM_INFINITY))
-    except Exception as e:
-        logger.warning(f"Could not set memory limits: {e}")
+# Pydantic models for API
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str
+    expires_in: int
+    refresh_token: Optional[str]
 
+class UserData(BaseModel):
+    id: int
+    username: str
+    email: Optional[str]
+
+class ScanStatusResponse(BaseModel):
+    scan_id: int
+    status: ScanStatus
+    repository_id: int
+    error: Optional[str]
+    findings_count: Optional[int]
+
+class RepositoryResponse(BaseModel):
+    id: int
+    name: str
+    url: str
+    last_scan: Optional[str]
+
+# Database
+class AsyncDatabaseSession:
+    def __init__(self):
+        self._session = None
+        self._engine = None
+
+    def __getattr__(self, name):
+        return getattr(self._session, name)
+
+    async def init(self):
+        self._engine = create_async_engine(
+            ASYNC_DATABASE_URL,
+            echo=False,
+            pool_size=20,
+            max_overflow=10,
+            pool_pre_ping=True,
+            pool_use_lifo=True
+        )
+        
+        async_session = sessionmaker(
+            self._engine, class_=AsyncSession, expire_on_commit=False
+        )
+        self._session = async_session()
+
+    async def create_all(self):
+        async with self._engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+    async def close(self):
+        if self._session:
+            await self._session.close()
+        if self._engine:
+            await self._engine.dispose()
+
+db = AsyncDatabaseSession()
+
+# GitLab Integration
 class GitLabIntegration:
-    def __init__(self, database_url: str, gitlab_url: str = "https://gitlab.com"):
-        self.engine = create_engine(database_url)
-        Base.metadata.create_all(self.engine)
-        self.Session = sessionmaker(bind=self.engine)
-        self.gitlab_url = gitlab_url
-        self.scan_semaphore = asyncio.Semaphore(2)
-        self.active_scans = set()
+    def __init__(self):
+        self.scan_semaphore = asyncio.Semaphore(SCAN_CONCURRENCY)
+        self._session = aiohttp.ClientSession()
 
-    async def verify_token_and_get_user(self, access_token: str) -> dict:
-        """Verify GitLab token and get user info"""
-        async with aiohttp.ClientSession() as session:
-            headers = {'Authorization': f"Bearer {access_token}"}
-            async with session.get(f"{self.gitlab_url}/api/v4/user", headers=headers) as response:
-                if response.status != 200:
-                    raise Exception("Failed to verify token")
-                return await response.json()
+    async def close(self):
+        if self._session:
+            await self._session.close()
 
-    async def _clone_repository(self, clone_url: str, temp_dir: Path, default_branch: str) -> bool:
-        """Clone repository with memory-efficient settings"""
+    async def verify_token(self, access_token: str) -> UserData:
+        async with self._session.get(
+            f"{GITLAB_URL}/api/v4/user",
+            headers={"Authorization": f"Bearer {access_token}"}
+        ) as response:
+            if response.status != 200:
+                raise HTTPException(status_code=401, detail="Invalid token")
+            data = await response.json()
+            return UserData(**data)
+
+    async def clone_repository(self, clone_url: str, temp_dir: Path, default_branch: str) -> bool:
         try:
-            git_env = {
-                'GIT_HTTP_LOW_SPEED_LIMIT': '1000',
-                'GIT_HTTP_LOW_SPEED_TIME': '10',
-                'GIT_ALLOC_LIMIT': '256M',
-                'GIT_PACK_THREADS': '1'
-            }
-            
-            repo = git.Repo.clone_from(
+            repo = await aiogit.clone(
                 clone_url,
                 temp_dir,
-                depth=1,
                 branch=default_branch,
-                single_branch=True,
-                env=git_env
+                depth=1,
+                single_branch=True
             )
-            
             return True
         except Exception as e:
-            logger.error(f"Clone failed: {str(e)}")
+            logger.error("clone_failed", error=str(e))
             return False
 
-    async def _run_semgrep_scan(self, temp_dir: Path) -> tuple:
-        """Run Semgrep scan with memory constraints"""
+    async def run_semgrep_scan(self, temp_dir: Path) -> tuple[bool, Optional[dict], Optional[str]]:
         try:
-            set_memory_limits()
+            # Set process memory limits
+            resource.setrlimit(resource.RLIMIT_AS, (MEMORY_LIMIT_MB * 1024 * 1024, resource.RLIM_INFINITY))
             
-            cmd = [
+            process = await asyncio.create_subprocess_exec(
                 "semgrep",
                 "scan",
                 "--config=auto",
                 "--json",
-                "--max-memory", "256",
+                "--max-memory", str(MEMORY_LIMIT_MB),
                 "--timeout", "30",
-                str(temp_dir)
-            ]
-            
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
+                str(temp_dir),
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                limit=256 * 1024 * 1024
+                stderr=asyncio.subprocess.PIPE
             )
             
             try:
                 stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=60)
+                if process.returncode == 0:
+                    results = json.loads(stdout)
+                    return True, results, None
+                return False, None, stderr.decode()
             except asyncio.TimeoutError:
                 if process:
                     try:
@@ -177,189 +217,277 @@ class GitLabIntegration:
                     except:
                         pass
                 return False, None, "Scan timeout exceeded"
-            
-            if process.returncode == 0:
-                try:
-                    results = json.loads(stdout)
-                    return True, results, None
-                except json.JSONDecodeError as e:
-                    return False, None, f"Failed to parse Semgrep output: {str(e)}"
-            else:
-                return False, None, stderr.decode()
-                
         except Exception as e:
             return False, None, str(e)
 
-    async def connect_gitlab_account(self, user_id: str, access_token: str) -> dict:
-        """Connect user's GitLab account and trigger scans"""
-        session = self.Session()
-        try:
-            gl = gitlab.Gitlab(self.gitlab_url, oauth_token=access_token)
-            gl.auth()
-            
-            projects = gl.projects.list(owned=True, all=True)
-            processed_repos = []
-            
-            for project in projects:
-                try:
-                    existing_repo = session.query(UserRepository).filter_by(
-                        user_id=user_id,
-                        gitlab_project_id=project.id
-                    ).first()
-                    
-                    if existing_repo:
-                        existing_repo.repository_name = project.name
-                        existing_repo.repository_url = project.web_url
-                        repo = existing_repo
-                    else:
-                        repo = UserRepository(
-                            user_id=user_id,
-                            gitlab_project_id=project.id,
-                            repository_name=project.name,
-                            repository_url=project.web_url,
-                            default_branch=project.default_branch,
-                            visibility=project.visibility,
-                            size_mb=project.statistics()['repository_size'] / 1024 / 1024 if hasattr(project, 'statistics') else 0
-                        )
-                        session.add(repo)
-                        session.flush()
-                    
-                    scan = ScanResult(
-                        repository_id=repo.id,
-                        user_id=user_id,
-                        status=ScanStatus.PENDING,
-                        branch=project.default_branch,
-                        scan_date=datetime.utcnow()
-                    )
-                    session.add(scan)
-                    session.flush()
-                    
-                    processed_repos.append({
-                        'id': repo.id,
-                        'name': project.name,
-                        'url': project.web_url,
-                        'scan_id': scan.id
-                    })
-                    
-                    logger.info(f"Created scan {scan.id} for repository {repo.id}")
-                    
-                    if scan.id:
-                        asyncio.create_task(self._scan_repository(
-                            user_id=user_id,
-                            repo_id=repo.id,
-                            access_token=access_token,
-                            gitlab_project_id=project.id,
-                            scan_id=scan.id
-                        ))
-                    
-                except Exception as e:
-                    logger.error(f"Error processing repository {project.name}: {str(e)}")
-                    continue
-            
-            session.commit()
-            return {
-                'success': True,
-                'message': f'Successfully connected GitLab account and initiated scans for {len(processed_repos)} repositories',
-                'repositories': processed_repos
-            }
-            
-        except Exception as e:
-            logger.error(f"Error connecting GitLab account: {str(e)}")
-            session.rollback()
-            raise
-        finally:
-            session.close()
-
-    async def _scan_repository(self, user_id: str, repo_id: int, access_token: str, 
-                             gitlab_project_id: int, scan_id: int):
-        """Run repository scan with concurrency control"""
+    async def scan_repository(
+        self,
+        user_id: str,
+        repo_id: int,
+        access_token: str,
+        gitlab_project_id: int,
+        scan_id: int
+    ):
         async with self.scan_semaphore:
-            logger.info(f"Starting scan {scan_id} for repository {repo_id}")
-            session = self.Session()
+            logger.info("scan_started", scan_id=scan_id, repo_id=repo_id)
             
             try:
-                scan = session.query(ScanResult).get(scan_id)
-                if not scan:
-                    return
-                
-                scan.status = ScanStatus.SCANNING
-                session.commit()
+                # Update scan status
+                async with db._session.begin():
+                    scan = await db._session.get(ScanResult, scan_id)
+                    if not scan:
+                        return
+                    scan.status = ScanStatus.SCANNING
                 
                 with tempfile.TemporaryDirectory(prefix='scanner_') as temp_dir_str:
                     temp_dir = Path(temp_dir_str)
                     
-                    gl = gitlab.Gitlab(self.gitlab_url, oauth_token=access_token)
-                    project = gl.projects.get(gitlab_project_id)
+                    # Get repository info from GitLab
+                    async with self._session.get(
+                        f"{GITLAB_URL}/api/v4/projects/{gitlab_project_id}",
+                        headers={"Authorization": f"Bearer {access_token}"}
+                    ) as response:
+                        if response.status != 200:
+                            raise Exception("Failed to get repository info")
+                        project_data = await response.json()
                     
-                    clone_url = project.http_url_to_repo.replace(
+                    # Clone repository
+                    clone_url = project_data['http_url_to_repo'].replace(
                         "https://",
                         f"https://oauth2:{access_token}@"
                     )
                     
-                    if not await self._clone_repository(clone_url, temp_dir, project.default_branch):
+                    if not await self.clone_repository(clone_url, temp_dir, project_data['default_branch']):
                         raise Exception("Repository clone failed")
                     
-                    success, results, error = await self._run_semgrep_scan(temp_dir)
+                    # Run scan
+                    success, results, error = await self.run_semgrep_scan(temp_dir)
                     
-                    if success and results:
-                        findings = results.get('results', [])[:100]
+                    async with db._session.begin():
+                        scan = await db._session.get(ScanResult, scan_id)
+                        if success and results:
+                            findings = results.get('results', [])[:100]
+                            
+                            severity_counts = {'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0}
+                            for finding in findings:
+                                severity = finding.get('extra', {}).get('severity', 'LOW').upper()
+                                severity_counts[severity] += 1
+                            
+                            scan.status = ScanStatus.COMPLETED
+                            scan.findings = findings
+                            scan.findings_count = len(findings)
+                            scan.critical_count = severity_counts['CRITICAL']
+                            scan.high_count = severity_counts['HIGH']
+                            scan.medium_count = severity_counts['MEDIUM']
+                            scan.low_count = severity_counts['LOW']
+                            scan.files_scanned = results.get('stats', {}).get('files_scanned', 0)
+                        else:
+                            scan.status = ScanStatus.FAILED
+                            scan.error_message = error
                         
-                        severity_counts = {'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0}
-                        for finding in findings:
-                            severity = finding.get('extra', {}).get('severity', 'LOW').upper()
-                            severity_counts[severity] += 1
-                        
-                        scan.status = ScanStatus.COMPLETED
-                        scan.findings = findings
-                        scan.findings_count = len(findings)
-                        scan.critical_count = severity_counts['CRITICAL']
-                        scan.high_count = severity_counts['HIGH']
-                        scan.medium_count = severity_counts['MEDIUM']
-                        scan.low_count = severity_counts['LOW']
-                        scan.files_scanned = results.get('stats', {}).get('files_scanned', 0)
-                    else:
-                        scan.status = ScanStatus.FAILED
-                        scan.error_message = error
-                
-                repo = session.query(UserRepository).get(repo_id)
-                if repo:
-                    repo.last_scan_at = datetime.utcnow()
-                
-                session.commit()
-                
+                        repo = await db._session.get(UserRepository, repo_id)
+                        if repo:
+                            repo.last_scan_at = datetime.utcnow()
+            
             except Exception as e:
-                logger.error(f"Scan error: {str(e)}")
-                try:
-                    scan = session.query(ScanResult).get(scan_id)
+                logger.error("scan_failed", scan_id=scan_id, error=str(e))
+                async with db._session.begin():
+                    scan = await db._session.get(ScanResult, scan_id)
                     if scan:
                         scan.status = ScanStatus.FAILED
                         scan.error_message = str(e)
-                        session.commit()
-                except Exception as inner_e:
-                    logger.error(f"Failed to update scan status: {str(inner_e)}")
-            finally:
-                session.close()
 
-    async def get_user_scan_results(self, user_id: str) -> dict:
-        """Get scan results for all user's repositories"""
-        session = self.Session()
-        try:
-            repositories = session.query(UserRepository).filter_by(
-                user_id=user_id,
-                is_active=True
-            ).all()
+gitlab = GitLabIntegration()
+
+# FastAPI app
+app = FastAPI(title="GitLab Security Scanner")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Startup and shutdown
+@app.on_event("startup")
+async def startup():
+    await db.init()
+    await db.create_all()
+
+@app.on_event("shutdown")
+async def shutdown():
+    await gitlab.close()
+    await db.close()
+
+# Routes
+@app.get("/")
+async def root():
+    """API root with available endpoints"""
+    return {
+        "status": "running",
+        "version": "1.0.0",
+        "endpoints": [
+            "/api/gitlab/login",
+            "/api/gitlab/oauth/callback",
+            "/api/gitlab/repos",
+            "/api/gitlab/scan/{scan_id}/status",
+            "/health"
+        ]
+    }
+
+@app.get("/api/gitlab/login")
+async def gitlab_login():
+    """Start GitLab OAuth flow"""
+    params = {
+        'client_id': GITLAB_CLIENT_ID,
+        'redirect_uri': GITLAB_REDIRECT_URI,
+        'response_type': 'code',
+        'scope': 'api read_user read_repository'
+    }
+    
+    authorize_url = f"{GITLAB_URL}/oauth/authorize"
+    query_string = "&".join(f"{k}={v}" for k, v in params.items())
+    
+    return RedirectResponse(f"{authorize_url}?{query_string}")
+
+@app.get("/api/gitlab/oauth/callback")
+async def gitlab_callback(
+    code: str,
+    background_tasks: BackgroundTasks
+):
+    """Handle GitLab OAuth callback"""
+    try:
+        # Exchange code for token
+        async with aiohttp.ClientSession() as session:
+            token_response = await session.post(
+                f"{GITLAB_URL}/oauth/token",
+                data={
+                    'client_id': GITLAB_CLIENT_ID,
+                    'client_secret': GITLAB_CLIENT_SECRET,
+                    'code': code,
+                    'grant_type': 'authorization_code',
+                    'redirect_uri': GITLAB_REDIRECT_URI
+                }
+            )
+            
+            token_data = await token_response.json()
+            if 'error' in token_data:
+                raise HTTPException(status_code=400, detail=token_data['error'])
+            
+            access_token = token_data['access_token']
+            
+            # Get user info
+            user = await gitlab.verify_token(access_token)
+            
+            # Connect account and start scans
+            async with db._session.begin():
+                # Get user's GitLab projects
+                async with aiohttp.ClientSession() as session:
+                    projects_response = await session.get(
+                        f"{GITLAB_URL}/api/v4/projects?owned=true",
+                        headers={"Authorization": f"Bearer {access_token}"}
+                    )
+                    projects = await projects_response.json()
+                
+                processed_repos = []
+                for project in projects:
+                    # Check if repository exists
+                    stmt = select(UserRepository).where(
+                        UserRepository.user_id == str(user.id),
+                        UserRepository.gitlab_project_id == project['id']
+                    )
+                    result = await db._session.execute(stmt)
+                    repo = result.scalar_one_or_none()
+                    
+                    if repo:
+                        repo.repository_name = project['name']
+                        repo.repository_url = project['web_url']
+                    else:
+                        repo = UserRepository(
+                            user_id=str(user.id),
+                            gitlab_project_id=project['id'],
+                            repository_name=project['name'],
+                            repository_url=project['web_url'],
+                            default_branch=project['default_branch'],
+                            visibility=project['visibility'],
+                            size_mb=project.get('statistics', {}).get('repository_size', 0) / 1024 / 1024
+                        )
+                        db._session.add(repo)
+                        await db._session.flush()
+                    
+                    scan = ScanResult(
+                        repository_id=repo.id,
+                        user_id=str(user.id),
+                        status=ScanStatus.PENDING,
+                        branch=project['default_branch'],
+                        scan_date=datetime.utcnow()
+                    )
+                    db._session.add(scan)
+                    await db._session.flush()
+                    
+                    processed_repos.append({
+                        'id': repo.id,
+                        'name': project['name'],
+                        'url': project['web_url'],
+                        'scan_id': scan.id
+                    })
+                    
+                    # Schedule scan
+                    background_tasks.add_task(
+                        gitlab.scan_repository,
+                        user_id=str(user.id),
+                        repo_id=repo.id,
+                        access_token=access_token,
+                        gitlab_project_id=project['id'],
+                        scan_id=scan.id
+                    )
+            
+            return JSONResponse({
+                'success': True,
+                'message': f'Successfully connected GitLab account and initiated scans for {len(processed_repos)} repositories',
+                'repositories': processed_repos,
+                'user': {
+                    'id': user.id,
+                    'username': user.username
+                }
+            })
+            
+    except Exception as e:
+        logger.error("oauth_callback_failed", error=str(e))
+        raise HTTPException(status_code=500, detail="OAuth process failed")
+
+@app.get("/api/gitlab/repos")
+async def list_repos(request: Request):
+    """List user's GitLab repositories and scan results"""
+    token = request.headers.get('Authorization')
+    if not token or not token.startswith('Bearer '):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    
+    try:
+        user = await gitlab.verify_token(token.split()[1])
+        
+        async with db._session() as session:
+            # Get all active repositories for user
+            stmt = select(UserRepository).where(
+                UserRepository.user_id == str(user.id),
+                UserRepository.is_active == True
+            )
+            result = await session.execute(stmt)
+            repositories = result.scalars().all()
             
             results = []
             for repo in repositories:
-                latest_scan = (
-                    session.query(ScanResult)
-                    .filter_by(repository_id=repo.id)
-                    .order_by(ScanResult.scan_date.desc())
-                    .first()
-                )
+                # Get latest scan for each repository
+                stmt = select(ScanResult).where(
+                    ScanResult.repository_id == repo.id
+                ).order_by(ScanResult.scan_date.desc()).limit(1)
+                scan_result = await session.execute(stmt)
+                latest_scan = scan_result.scalar_one_or_none()
                 
                 if latest_scan:
-                    results.append({
+                    result = {
                         'repository': {
                             'id': repo.id,
                             'name': repo.repository_name,
@@ -369,6 +497,11 @@ class GitLabIntegration:
                         'scan_results': {
                             'status': latest_scan.status.value,
                             'scan_date': latest_scan.scan_date.isoformat(),
+                        }
+                    }
+                    
+                    if latest_scan.status == ScanStatus.COMPLETED:
+                        result['scan_results'].update({
                             'findings_count': latest_scan.findings_count,
                             'severity_counts': {
                                 'critical': latest_scan.critical_count,
@@ -376,237 +509,122 @@ class GitLabIntegration:
                                 'medium': latest_scan.medium_count,
                                 'low': latest_scan.low_count
                             }
-                        } if latest_scan.status == ScanStatus.COMPLETED else {
-                            'status': latest_scan.status.value,
-                            'error': latest_scan.error_message
-                        }
-                    })
+                        })
+                    elif latest_scan.status == ScanStatus.FAILED:
+                        result['scan_results']['error'] = latest_scan.error_message
+                        
+                    results.append(result)
             
             return {
                 'success': True,
                 'data': {
-                    'user_id': user_id,
+                    'user_id': str(user.id),
                     'repositories': results
                 }
             }
             
-        except Exception as e:
-            logger.error(f"Error getting scan results: {str(e)}")
-            return {
-                'success': False,
-                'error': str(e)
-            }
-        finally:
-            session.close()
+    except Exception as e:
+        logger.error("list_repos_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
-    async def get_scan_status(self, scan_id: int) -> dict:
-        """Get the current status of a scan"""
-        session = self.Session()
-        try:
-            scan = session.query(ScanResult).get(scan_id)
+@app.get("/api/gitlab/scan/{scan_id}/status", response_model=ScanStatusResponse)
+async def get_scan_status(scan_id: int, request: Request):
+    """Get the status of a specific scan"""
+    token = request.headers.get('Authorization')
+    if not token or not token.startswith('Bearer '):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    
+    try:
+        user = await gitlab.verify_token(token.split()[1])
+        
+        async with db._session() as session:
+            stmt = select(ScanResult).where(
+                ScanResult.id == scan_id,
+                ScanResult.user_id == str(user.id)
+            )
+            result = await session.execute(stmt)
+            scan = result.scalar_one_or_none()
+            
             if not scan:
-                return {'error': f'Scan {scan_id} not found'}
+                raise HTTPException(status_code=404, detail=f"Scan {scan_id} not found")
             
             return {
                 'scan_id': scan.id,
-                'status': scan.status.value,
+                'status': scan.status,
                 'repository_id': scan.repository_id,
-                'error': scan.error_message if scan.error_message else None,
-                'findings_count': scan.findings_count if scan.status == ScanStatus.COMPLETED else None,
+                'error': scan.error_message,
+                'findings_count': scan.findings_count if scan.status == ScanStatus.COMPLETED else None
             }
-        finally:
-            session.close()
-
-# Initialize Flask app with async support
-app = Flask(__name__)
-app.secret_key = os.getenv('FLASK_SECRET_KEY')
-asgi_app = WsgiToAsgi(app)
-
-# GitLab OAuth Configuration
-GITLAB_CLIENT_ID = os.getenv('GITLAB_CLIENT_ID')
-GITLAB_CLIENT_SECRET = os.getenv('GITLAB_CLIENT_SECRET')
-GITLAB_REDIRECT_URI = os.getenv('GITLAB_REDIRECT_URI')
-GITLAB_URL = 'https://gitlab.com'
-
-# Initialize GitLab integration
-gitlab_integration = GitLabIntegration(
-    database_url=os.getenv('DATABASE_URL'),
-    gitlab_url=GITLAB_URL
-)
-
-def requires_auth(f):
-    """Authentication decorator for routes"""
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if 'gitlab_token' not in session:
-            return jsonify({'error': 'Not authenticated'}), 401
-        return f(*args, **kwargs)
-    return decorated
-
-@app.route('/api/gitlab/login')
-def gitlab_login():
-    """Start GitLab OAuth flow"""
-    authorize_url = f"{GITLAB_URL}/oauth/authorize"
-    params = {
-        'client_id': GITLAB_CLIENT_ID,
-        'redirect_uri': GITLAB_REDIRECT_URI,
-        'response_type': 'code',
-        'scope': 'api read_user read_repository'
-    }
-    
-    return redirect(f"{authorize_url}?{'&'.join(f'{k}={v}' for k, v in params.items())}")
-
-@app.route('/api/gitlab/oauth/callback')
-async def gitlab_callback():
-    """Handle GitLab OAuth callback"""
-    if 'error' in request.args:
-        return jsonify({'error': request.args['error']}), 400
-    
-    if 'code' not in request.args:
-        return jsonify({'error': 'No code provided'}), 400
-
-    try:
-        token_url = f"{GITLAB_URL}/oauth/token"
-        token_data = {
-            'client_id': GITLAB_CLIENT_ID,
-            'client_secret': GITLAB_CLIENT_SECRET,
-            'code': request.args['code'],
-            'grant_type': 'authorization_code',
-            'redirect_uri': GITLAB_REDIRECT_URI
-        }
-        
-        async with aiohttp.ClientSession() as client:
-            # Get access token
-            async with client.post(token_url, data=token_data) as token_response:
-                token_result = await token_response.json()
-                
-                if 'error' in token_result:
-                    logger.error(f"GitLab OAuth error: {token_result['error']}")
-                    return jsonify({'error': token_result['error']}), 400
-                
-                if 'access_token' not in token_result:
-                    logger.error(f"No access token in response: {token_result}")
-                    return jsonify({'error': 'No access token received'}), 400
-                
-                access_token = token_result['access_token']
             
-            # Get user info
-            user_url = f"{GITLAB_URL}/api/v4/user"
-            headers = {'Authorization': f"Bearer {access_token}"}
-            
-            async with client.get(user_url, headers=headers) as user_response:
-                user_data = await user_response.json()
-                
-                if 'id' not in user_data:
-                    logger.error(f"Invalid user data response: {user_data}")
-                    return jsonify({'error': 'Failed to get user info'}), 400
-                
-                # Store in session
-                flask_session = session._get_current_object()
-                flask_session['gitlab_token'] = access_token
-                flask_session['gitlab_user_id'] = user_data['id']
-                
-                # Start repository scanning
-                scan_result = await gitlab_integration.connect_gitlab_account(
-                    user_id=str(user_data['id']),
-                    access_token=access_token
-                )
-                
-                return jsonify({
-                    'success': True,
-                    'message': 'Successfully connected GitLab account',
-                    'scan_initiated': scan_result
-                })
-                
     except Exception as e:
-        logger.error(f"OAuth error: {str(e)}")
-        return jsonify({'error': 'OAuth process failed'}), 500
+        logger.error("get_scan_status_failed", scan_id=scan_id, error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.route('/api/gitlab/repos')
-@requires_auth
-async def list_repos():
-    """List user's GitLab repositories and scan results"""
-    results = await gitlab_integration.get_user_scan_results(
-        user_id=str(session['gitlab_user_id'])
-    )
-    return jsonify(results)
-
-@app.route('/api/gitlab/scan/<int:scan_id>/status')
-@requires_auth
-async def get_scan_status(scan_id):
-    """Get the status of a specific scan"""
-    try:
-        status = await gitlab_integration.get_scan_status(scan_id)
-        return jsonify(status)
-    except Exception as e:
-        logger.error(f"Error getting scan status: {str(e)}")
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/health')
-def health_check():
+@app.get("/health")
+async def health_check():
     """Health check endpoint"""
     try:
+        # Verify database connection
+        async with db._session() as session:
+            await session.execute(select(1))
+        
         # Verify semgrep installation
-        import subprocess
-        result = subprocess.run(['semgrep', '--version'], 
-                              capture_output=True, 
-                              text=True)
+        process = await asyncio.create_subprocess_exec(
+            'semgrep',
+            '--version',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await process.communicate()
         
-        # Check database connection
-        with gitlab_integration.Session() as session:
-            session.execute('SELECT 1')
-        
-        return jsonify({
+        return {
             'status': 'healthy',
-            'semgrep_version': result.stdout.strip(),
-            'database': 'connected'
-        })
+            'database': 'connected',
+            'semgrep_version': stdout.decode().strip()
+        }
     except Exception as e:
-        logger.error(f"Health check failed: {str(e)}")
-        return jsonify({
-            'status': 'unhealthy',
-            'error': str(e)
-        }), 500
-    
-def cleanup():
-    """Cleanup function to be called on shutdown"""
-    logger.info("Application shutting down...")
-    try:
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        
-        tasks = asyncio.all_tasks(loop) if hasattr(asyncio, 'all_tasks') else set()
-        for task in tasks:
-            task.cancel()
-            
-        if loop.is_running():
-            loop.stop()
-            
-    except Exception as e:
-        logger.error(f"Error during cleanup: {e}")
+        logger.error("health_check_failed", error=str(e))
+        return JSONResponse(
+            status_code=500,
+            content={
+                'status': 'unhealthy',
+                'error': str(e)
+            }
+        )
 
-# Update signal handler as well
-def handle_sigterm(signum, frame):
-    """Handle SIGTERM signal gracefully"""
-    logger.info("Received SIGTERM. Performing graceful shutdown...")
-    try:
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        
-        tasks = asyncio.all_tasks(loop) if hasattr(asyncio, 'all_tasks') else set()
-        for task in tasks:
-            task.cancel()
-            
-        if loop.is_running():
-            loop.stop()
-            
-    except Exception as e:
-        logger.error(f"Error during cleanup: {e}")
+# Signal handlers
+async def shutdown_signal_handler():
+    """Handle shutdown signals gracefully"""
+    logger.info("shutting_down_application")
     
-    sys.exit(0)
+    # Cancel all running tasks
+    for task in asyncio.all_tasks():
+        if task is not asyncio.current_task():
+            task.cancel()
+    
+    # Wait for tasks to complete
+    await asyncio.gather(*asyncio.all_tasks(), return_exceptions=True)
+    
+    # Cleanup
+    await gitlab.close()
+    await db.close()
+
+def handle_signals():
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(
+            sig,
+            lambda s=sig: asyncio.create_task(shutdown_signal_handler())
+        )
+
+if __name__ == "__main__":
+    handle_signals()
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        workers=4,
+        loop="asyncio",
+        log_level="info",
+        access_log=True
+    )
