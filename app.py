@@ -7,31 +7,25 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Enum, Float, Text, Boolean, select
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
-from sqlalchemy.pool import AsyncAdapterPool
 from datetime import datetime
-import enum
-import logging
-import sys
 import resource
 import tempfile
-import shutil
 import asyncio
-import aiohttp
-from pathlib import Path
-import json
-import aiogit
 import signal
-from typing import Optional, List, Dict, Any
-import os
-from pydantic import BaseModel, Field
-import uvicorn
-from contextlib import asynccontextmanager
-
-# Configure logging with structlog for better output
+import enum
+import logging
 import structlog
+import os
+from typing import Optional, List, Dict, Any
+from pydantic import BaseModel
 
+# Configure logging
 logger = structlog.get_logger()
 logging.basicConfig(level=logging.INFO)
+
+# Initialize FastAPI app
+app = FastAPI(title="GitLab Security Scanner")
+
 
 # Constants
 MEMORY_LIMIT_MB = 256
@@ -591,6 +585,7 @@ async def health_check():
                 'error': str(e)
             }
         )
+
 
 # Signal handlers
 async def shutdown_signal_handler():

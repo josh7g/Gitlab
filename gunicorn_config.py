@@ -1,29 +1,20 @@
+import multiprocessing
 import os
 
-# Basic configuration
-bind = f"0.0.0.0:{os.getenv('PORT', '10000')}"
-workers = 1
+# Gunicorn config
+bind = f"0.0.0.0:{os.getenv('PORT', '8000')}"
+workers = multiprocessing.cpu_count() * 2 + 1
 worker_class = "uvicorn.workers.UvicornWorker"
+timeout = 120
+keepalive = 5
+max_requests = 1000
+max_requests_jitter = 50
+log_level = "info"
 
-# Timeouts
-timeout = 300
-keepalive = 65
-graceful_timeout = 120
-
-# Request limits
-max_requests = 1200
-max_requests_jitter = 100
-
-# Temporary directory
-worker_tmp_dir = "/dev/shm"
-
-# Performance
-worker_connections = 1000
-preload_app = True
+# SSL config (if needed)
+keyfile = os.getenv("SSL_KEYFILE", None)
+certfile = os.getenv("SSL_CERTFILE", None)
 
 # Logging
 accesslog = "-"
 errorlog = "-"
-loglevel = "info"
-capture_output = True
-

@@ -1,15 +1,19 @@
 services:
   - type: web
-    name: gitlab-analysis
+    name: gitlab-scanner
     env: python
-    buildCommand: |
-      curl -sSL https://github.com/returntocorp/semgrep/releases/download/v1.96.0/semgrep-v1.96.0-ubuntu-20.04.tgz -o semgrep.tgz
-      tar -xzf semgrep.tgz
-      sudo mv semgrep /usr/local/bin/
-      pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 2 --timeout 120
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn asgi_app:asgi_app -c gunicorn_config.py
     envVars:
       - key: PYTHON_VERSION
-        value: 3.9.0
-      - key: PATH
-        value: /usr/local/bin:${PATH}
+        value: 3.11.0
+      - key: DATABASE_URL
+        sync: false
+      - key: GITLAB_CLIENT_ID
+        sync: false
+      - key: GITLAB_CLIENT_SECRET
+        sync: false
+      - key: GITLAB_REDIRECT_URI
+        sync: false
+    healthCheckPath: /health
+    autoDeploy: true
