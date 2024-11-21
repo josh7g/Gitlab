@@ -332,7 +332,7 @@ class GitLabIntegration:
                 'scan',
                 '--json',
                 '--config=p/ci',  # Use auto configuration
-                '--metrics=on', #personal addition
+                '--metrics=on', 
                 '--timeout=300',
                 '--max-memory=256',
                 '--disable-version-check',
@@ -659,19 +659,52 @@ async def health_check():
 # Signal handlers
 async def shutdown_signal_handler():
     """Handle shutdown signals gracefully"""
-    logger.info("shutting_down_application")
+    logger.info("initiating_graceful_shutdown")
     
-    # Cancel all running tasks
-    for task in asyncio.all_tasks():
-        if task is not asyncio.current_task():
-            task.cancel()
+    # Get all running tasks
+    running_tasks = [
+        task for task in asyncio.all_tasks()
+        if task is not asyncio.current_task() 
+        and not task.done()
+        and 'scan_repository' in str(task.get_coro())
+    ]
     
-    # Wait for tasks to complete
-    await asyncio.gather(*asyncio.all_tasks(), return_exceptions=True)
+    if running_tasks:
+        logger.info(f"waiting_for_{len(running_tasks)}_scans_to_complete")
+        
+        # Wait for running scans with timeout
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*running_tasks, return_exceptions=True),
+                timeout=300  # 5 minute timeout for scans to complete
+            )
+        except asyncio.TimeoutError:
+            logger.warning("some_scans_did_not_complete_in_time")
+            
+            # Cancel remaining tasks
+            for task in running_tasks:
+                if not task.done():
+                    task.cancel()
+    
+    # Cancel any other tasks
+    other_tasks = [
+        task for task in asyncio.all_tasks()
+        if task is not asyncio.current_task() 
+        and not task.done()
+        and 'scan_repository' not in str(task.get_coro())
+    ]
+    
+    for task in other_tasks:
+        task.cancel()
+    
+    if other_tasks:
+        await asyncio.gather(*other_tasks, return_exceptions=True)
     
     # Cleanup
     await gitlab.close()
     await db.close()
+    
+    logger.info("shutdown_complete")
 
 def handle_signals():
     loop = asyncio.get_event_loop()
@@ -680,4 +713,3 @@ def handle_signals():
             sig,
             lambda s=sig: asyncio.create_task(shutdown_signal_handler())
         )
-
