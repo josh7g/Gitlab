@@ -321,13 +321,7 @@ class GitLabIntegration:
                         
     async def run_semgrep_scan(self, repo_path: str) -> tuple[bool, dict, str]:
         """
-        Run Semgrep security scan on repository
-        
-        Args:
-            repo_path: Path to repository directory
-            
-        Returns:
-            Tuple of (success, results, error)
+        Run Semgrep security scan on repository focusing on security rules
         """
         try:
             # Set memory and CPU limits
@@ -336,41 +330,57 @@ class GitLabIntegration:
             # Create process with timeout
             process = await asyncio.create_subprocess_exec(
                 'semgrep',
-                'scan',  # Add 'scan' subcommand
+                'scan',
                 '--json',
-                '--config=auto',
-                '--timeout=300',
-                '--max-memory=256',
-                '--metrics=on',
-                '--disable-version-check',  
-                '--timeout-threshold=3',
+                '--config=p/security',  # Use security-focused ruleset
+                '--timeout=180',
+                '--max-memory=128',
+                '--timeout-threshold=2',
+                '--skip-unknown-extensions',
+                '--exclude=test',
+                '--exclude=tests',
+                '--exclude=vendor',
+                '--exclude=node_modules',
+                '--error',
                 repo_path,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                stderr=asyncio.subprocess.PIPE,
+                env={
+                    **os.environ,
+                    'SEMGREP_ENABLE_VERSION_CHECK': '0',
+                    'SEMGREP_USER_AGENT_APPEND': 'gitlab-scanner',
+                    'SEMGREP_SEND_METRICS': '1'
+                }
             )
             
             try:
                 stdout, stderr = await asyncio.wait_for(
                     process.communicate(),
-                    timeout=360  # 6 minutes total timeout
+                    timeout=240
                 )
+                
+                stderr_text = stderr.decode().strip()
+                if "METRICS:" in stderr_text and process.returncode in (0, 1):
+                    try:
+                        results = json.loads(stdout.decode())
+                        return True, results, None
+                    except json.JSONDecodeError as e:
+                        return False, None, f"Failed to parse Semgrep output: {str(e)}"
+                
+                if process.returncode not in (0, 1):
+                    return False, None, f"Semgrep scan failed: {stderr_text}"
+                
+                try:
+                    results = json.loads(stdout.decode())
+                    return True, results, None
+                except json.JSONDecodeError as e:
+                    return False, None, f"Failed to parse Semgrep output: {str(e)}"
+                    
             except asyncio.TimeoutError:
                 if process.returncode is None:
                     process.terminate()
                     await process.wait()
-                return False, None, "Scan timed out after 6 minutes"
-            
-            if process.returncode != 0 and process.returncode != 1:
-                # returncode 1 is normal when findings are found
-                error_msg = stderr.decode().strip()
-                logger.error("semgrep_scan_failed", error=error_msg)
-                return False, None, f"Semgrep scan failed: {error_msg}"
-            
-            try:
-                results = json.loads(stdout.decode())
-                return True, results, None
-            except json.JSONDecodeError as e:
-                return False, None, f"Failed to parse Semgrep output: {str(e)}"
+                return False, None, "Scan timed out after 4 minutes"
                 
         except Exception as e:
             logger.error("semgrep_scan_error", error=str(e))
