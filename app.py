@@ -264,8 +264,8 @@ class GitLabSecurityScanner:
                 "semgrep",
                 "scan",
                 "--json",
-                "--config", "auto",  # Use the CI ruleset from registry
-                "--metrics=on",  # Explicitly disable metrics
+                "--config", "p/ci",  # Use the CI ruleset from registry
+                "--metrics=off",  # Explicitly disable metrics
                 f"--max-memory={self.config.max_memory_mb}",
                 "--optimizations=all",
                 "--timeout", str(self.config.file_timeout_seconds),   
