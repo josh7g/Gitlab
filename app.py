@@ -165,7 +165,6 @@ class GitLabIntegration:
     def __init__(self):
         self.scan_semaphore = asyncio.Semaphore(2)
         self.executor = ThreadPoolExecutor(max_workers=4)
-        
         self._session = None
     
     async def init(self):
@@ -173,12 +172,40 @@ class GitLabIntegration:
         if self._session is None:
             self._session = aiohttp.ClientSession()
 
+    async def verify_token(self, access_token: str) -> UserData:
+        """Verify GitLab token and get user information"""
+        if not self._session:
+            await self.init()
+            
+        try:
+            async with self._session.get(
+                f"{GITLAB_URL}/api/v4/user",
+                headers={"Authorization": f"Bearer {access_token}"}
+            ) as response:
+                if response.status != 200:
+                    raise HTTPException(
+                        status_code=401,
+                        detail="Invalid or expired token"
+                    )
+                
+                user_data = await response.json()
+                return UserData(
+                    id=user_data['id'],
+                    username=user_data['username'],
+                    email=user_data.get('email')
+                )
+        except Exception as e:
+            logger.error("token_verification_failed", error=str(e))
+            raise HTTPException(
+                status_code=401,
+                detail="Token verification failed"
+            )
+
     async def close(self):
         """Clean up resources"""
         if self._session:
             await self._session.close()
         self.executor.shutdown(wait=True)
-
 
     def _clone_repo_sync(self, clone_url: str, temp_dir: str, default_branch: str) -> bool:
         """Synchronous repository cloning using GitPython"""
