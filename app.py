@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request,Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
@@ -27,6 +27,7 @@ import fnmatch
 import shutil
 import psutil
 from pathlib import Path
+
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -625,7 +626,7 @@ async def root():
     }
 
 @app.get("/api/gitlab/login")
-async def gitlab_login(user_id: str = Query(..., description="User ID")):
+async def gitlab_login(user_id: str):  # Simplified parameter
     """Start GitLab OAuth flow using provided user ID"""
     params = {
         'client_id': GITLAB_CLIENT_ID,
@@ -639,6 +640,7 @@ async def gitlab_login(user_id: str = Query(..., description="User ID")):
     query_string = "&".join(f"{k}={v}" for k, v in params.items())
     
     return RedirectResponse(f"{authorize_url}?{query_string}")
+
 
 @app.get("/api/gitlab/oauth/callback")
 async def gitlab_callback(
