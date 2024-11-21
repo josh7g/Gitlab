@@ -258,23 +258,24 @@ class GitLabSecurityScanner:
             raise RuntimeError(f"Repository clone failed: {str(e)}") from e
 
     async def _scan_chunk(self, files: List[str]) -> List[Dict]:
+        """Scan a single chunk of files using Semgrep registry rules"""
         try:
             cmd = [
                 "semgrep",
                 "scan",
-                "--config", "auto",
                 "--json",
-                "--metrics=on",
+                "--config", "auto",  # Use the CI ruleset from registry
+                "--metrics=on",  # Explicitly disable metrics
                 f"--max-memory={self.config.max_memory_mb}",
-                "--jobs=1",
-                f"--timeout={self.config.file_timeout_seconds}",
                 "--optimizations=all",
+                "--timeout", str(self.config.file_timeout_seconds),   
             ] + files
 
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                stderr=asyncio.subprocess.PIPE,
+                limit=1024 * 1024 * 10  # 10MB buffer for output
             )
 
             try:
@@ -286,21 +287,102 @@ class GitLabSecurityScanner:
                 if process.returncode is None:
                     process.terminate()
                     await process.wait()
+                logger.warning(f"Scan timeout for chunk with {len(files)} files")
                 return []
 
-            if process.returncode != 0 and process.returncode != 1:
-                logger.warning(f"Semgrep error: {stderr.decode()}")
+            # Handle semgrep output
+            stdout_output = stdout.decode() if stdout else ""
+            stderr_output = stderr.decode() if stderr else ""
+
+            # Log errors that aren't just informational
+            if stderr_output and not any(x in stderr_output for x in ['METRICS:', 'Running autofix']):
+                logger.warning(f"Semgrep stderr: {stderr_output}")
+
+            if process.returncode not in [0, 1]:
+                logger.error(f"Semgrep exited with code {process.returncode}")
+                if stderr_output:
+                    logger.error(f"Error details: {stderr_output}")
                 return []
 
-            output = stdout.decode()
-            if not output.strip():
+            if not stdout_output.strip():
                 return []
 
-            return json.loads(output).get('results', [])
+            try:
+                results = json.loads(stdout_output)
+                findings = results.get('results', [])
+                
+                # Enhanced logging
+                if findings:
+                    severities = {}
+                    for finding in findings:
+                        sev = finding.get('extra', {}).get('severity', 'unknown')
+                        severities[sev] = severities.get(sev, 0) + 1
+                    
+                    logger.info(
+                        f"Scan completed: {len(findings)} findings "
+                        f"({', '.join(f'{k}: {v}' for k, v in severities.items())})"
+                    )
+                else:
+                    logger.info("Scan completed: No findings")
+                
+                return findings
+
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse Semgrep output: {str(e)}")
+                return []
 
         except Exception as e:
-            logger.error(f"Chunk scan error: {e}")
+            logger.error(f"Error during chunk scan: {str(e)}")
             return []
+
+    def _process_results(self, findings: List[Dict]) -> Dict:
+        """Process and categorize scan findings with enhanced metadata"""
+        severity_counts = {'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0}
+        category_counts = {}
+        processed_findings = []
+        files_with_findings = set()
+
+        for finding in findings:
+            severity = finding.get('extra', {}).get('severity', 'LOW').upper()
+            category = finding.get('extra', {}).get('metadata', {}).get('category', 'security')
+            file_path = finding.get('path', '')
+            
+            severity_counts[severity] = severity_counts.get(severity, 0) + 1
+            category_counts[category] = category_counts.get(category, 0) + 1
+            
+            if file_path:
+                files_with_findings.add(file_path)
+            
+            processed_findings.append({
+                'id': finding.get('check_id'),
+                'file': file_path,
+                'line_start': finding.get('start', {}).get('line'),
+                'line_end': finding.get('end', {}).get('line'),
+                'code_snippet': finding.get('extra', {}).get('lines', ''),
+                'message': finding.get('extra', {}).get('message', ''),
+                'severity': severity,
+                'category': category,
+                'cwe': finding.get('extra', {}).get('metadata', {}).get('cwe', []),
+                'owasp': finding.get('extra', {}).get('metadata', {}).get('owasp', []),
+                'references': finding.get('extra', {}).get('metadata', {}).get('references', []),
+                'fix_recommendations': finding.get('extra', {}).get('metadata', {}).get('fix', '')
+            })
+
+        self.scan_stats.update({
+            'findings_count': len(findings),
+            'files_with_findings': len(files_with_findings),
+            'memory_usage_mb': psutil.Process().memory_info().rss / (1024 * 1024)
+        })
+
+        return {
+            'findings': processed_findings[:100],  # Limit to 100 findings as before
+            'stats': {
+                'total_findings': len(findings),
+                'severity_counts': severity_counts,
+                'category_counts': category_counts,
+                'scan_stats': self.scan_stats
+            }
+        }
 
     async def _run_chunked_scan(self, target_dir: Path) -> Dict:
         all_files = []
