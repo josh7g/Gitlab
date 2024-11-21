@@ -331,7 +331,7 @@ class GitLabIntegration:
                 'semgrep',
                 'scan',
                 '--json',
-                '--config=p/ci',  # Use auto configuration
+                '--config=auto',  # Use auto configuration
                 '--metrics=on', 
                 '--timeout=300',
                 '--max-memory=256',
