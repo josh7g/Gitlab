@@ -8,6 +8,7 @@ from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Enum, Floa
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 from datetime import datetime
+import json
 import resource
 import tempfile
 import signal
@@ -317,6 +318,62 @@ class GitLabIntegration:
                     if scan:
                         scan.status = ScanStatus.FAILED
                         scan.error_message = str(e)
+                        
+    async def run_semgrep_scan(self, repo_path: str) -> tuple[bool, dict, str]:
+        """
+        Run Semgrep security scan on repository
+        
+        Args:
+            repo_path: Path to repository directory
+            
+        Returns:
+            Tuple of (success, results, error)
+        """
+        try:
+            # Set memory and CPU limits
+            resource.setrlimit(resource.RLIMIT_AS, (MEMORY_LIMIT_MB * 1024 * 1024, MEMORY_LIMIT_MB * 1024 * 1024))
+            
+            # Create process with timeout
+            process = await asyncio.create_subprocess_exec(
+                'semgrep',
+                '--json',
+                '--config=auto',
+                '--timeout=300',
+                '--max-memory=256',
+                '--metrics=off',
+                '--enable-version-check=no',
+                '--timeout-threshold=3',
+                repo_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=360  # 6 minutes total timeout
+                )
+            except asyncio.TimeoutError:
+                if process.returncode is None:
+                    process.terminate()
+                    await process.wait()
+                return False, None, "Scan timed out after 6 minutes"
+            
+            if process.returncode != 0 and process.returncode != 1:
+                # returncode 1 is normal when findings are found
+                error_msg = stderr.decode().strip()
+                logger.error("semgrep_scan_failed", error=error_msg)
+                return False, None, f"Semgrep scan failed: {error_msg}"
+            
+            try:
+                results = json.loads(stdout.decode())
+                return True, results, None
+            except json.JSONDecodeError as e:
+                return False, None, f"Failed to parse Semgrep output: {str(e)}"
+                
+        except Exception as e:
+            logger.error("semgrep_scan_error", error=str(e))
+            return False, None, f"Error running Semgrep scan: {str(e)}"
 
 gitlab = GitLabIntegration()
 
