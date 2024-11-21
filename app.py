@@ -332,6 +332,7 @@ class GitLabIntegration:
                 'scan',
                 '--json',
                 '--config=p/ci',  # Use auto configuration
+                '--metrics=on', #personal addition
                 '--timeout=300',
                 '--max-memory=256',
                 '--disable-version-check',
