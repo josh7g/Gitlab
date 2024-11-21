@@ -20,12 +20,17 @@ from typing import Optional, List, Dict, Any
 from pydantic import BaseModel
 import git
 import asyncio
-import aiohttp  
+import aiohttp
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+import fnmatch
+import shutil
+import psutil
+from pathlib import Path
 
 # Configure logging
-logger = structlog.get_logger()
 logging.basicConfig(level=logging.INFO)
+logger = structlog.get_logger()
 
 # Initialize FastAPI app
 app = FastAPI(title="GitLab Security Scanner")
@@ -39,11 +44,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-
 # Constants
-MEMORY_LIMIT_MB = 256
-SCAN_CONCURRENCY = 2
 GITLAB_URL = os.getenv('GITLAB_URL', 'https://gitlab.com')
 GITLAB_CLIENT_ID = os.getenv('GITLAB_CLIENT_ID')
 GITLAB_CLIENT_SECRET = os.getenv('GITLAB_CLIENT_SECRET')
@@ -53,7 +54,33 @@ DATABASE_URL = os.getenv('DATABASE_URL')
 # Convert SQLAlchemy URL to async
 ASYNC_DATABASE_URL = DATABASE_URL.replace('postgresql://', 'postgresql+asyncpg://')
 
-# Models
+# Scanner Configuration
+@dataclass
+class GitLabScanConfig:
+    """Configuration for GitLab repository scanning"""
+    max_file_size_mb: int = 25
+    max_total_size_mb: int = 300
+    max_memory_mb: int = 1500
+    chunk_size_mb: int = 30
+    max_files_per_chunk: int = 50
+    
+    timeout_seconds: int = 540  # 9 minutes
+    chunk_timeout: int = 120    # 2 minutes per chunk
+    file_timeout_seconds: int = 20
+    max_retries: int = 2
+    concurrent_processes: int = 1
+
+    exclude_patterns: List[str] = field(default_factory=lambda: [
+        '.git', '.svn', 'node_modules', 'vendor',
+        'bower_components', 'packages', 'dist',
+        'build', 'out', 'venv', '.env', '__pycache__',
+        '*.min.*', '*.bundle.*', '*.map', 
+        '*.{pdf,jpg,jpeg,png,gif,zip,tar,gz,rar,mp4,mov}',
+        'package-lock.json', 'yarn.lock',
+        'coverage', 'test*', 'docs'
+    ])
+
+# Database Models
 Base = declarative_base()
 
 class ScanStatus(str, enum.Enum):
@@ -100,7 +127,7 @@ class ScanResult(Base):
     files_skipped = Column(Integer)
     repository = relationship("UserRepository", back_populates="scan_results")
 
-# Pydantic models for API
+# Pydantic Models
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str
@@ -125,7 +152,7 @@ class RepositoryResponse(BaseModel):
     url: str
     last_scan: Optional[str]
 
-# Database
+# Database Session
 class AsyncDatabaseSession:
     def __init__(self):
         self._session = None
@@ -161,6 +188,219 @@ class AsyncDatabaseSession:
 
 db = AsyncDatabaseSession()
 
+# Security Scanner Implementation
+class GitLabSecurityScanner:
+    """Enhanced security scanner for GitLab repositories"""
+    
+    def __init__(self, config: GitLabScanConfig = GitLabScanConfig()):
+        self.config = config
+        self.temp_dir = None
+        self.repo_dir = None
+        self.scan_stats = {
+            'start_time': None,
+            'end_time': None,
+            'total_files': 0,
+            'files_processed': 0,
+            'files_skipped': 0,
+            'files_too_large': 0,
+            'total_size_mb': 0,
+            'memory_usage_mb': 0,
+            'findings_count': 0
+        }
+
+    async def __aenter__(self):
+        self.temp_dir = Path(tempfile.mkdtemp(prefix='gitlab_scanner_'))
+        logger.info(f"Created temporary directory: {self.temp_dir}")
+        self.scan_stats['start_time'] = datetime.now()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        try:
+            if self.temp_dir and self.temp_dir.exists():
+                shutil.rmtree(self.temp_dir)
+                logger.info(f"Cleaned up temporary directory: {self.temp_dir}")
+                self.scan_stats['end_time'] = datetime.now()
+        except Exception as e:
+            logger.error(f"Error during cleanup: {str(e)}")
+
+    async def _clone_repository(self, clone_url: str, access_token: str, default_branch: str) -> Path:
+        try:
+            self.repo_dir = self.temp_dir / f"repo_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            auth_url = clone_url.replace('https://', f'https://oauth2:{access_token}@')
+            
+            logger.info(f"Cloning repository to {self.repo_dir}")
+            
+            git_options = [
+                '--depth=1',
+                '--single-branch',
+                '--no-tags',
+                f'--branch={default_branch}',
+                '--filter=blob:none'
+            ]
+            
+            repo = git.Repo.clone_from(
+                auth_url,
+                self.repo_dir,
+                multi_options=git_options,
+                env={
+                    'GIT_HTTP_LOW_SPEED_LIMIT': '1000',
+                    'GIT_HTTP_LOW_SPEED_TIME': '10',
+                    'GIT_ALLOC_LIMIT': '256M',
+                    'GIT_PACK_THREADS': '1'
+                }
+            )
+
+            return self.repo_dir
+
+        except Exception as e:
+            if self.repo_dir and self.repo_dir.exists():
+                shutil.rmtree(self.repo_dir)
+            raise RuntimeError(f"Repository clone failed: {str(e)}") from e
+
+    async def _scan_chunk(self, files: List[str]) -> List[Dict]:
+        try:
+            cmd = [
+                "semgrep",
+                "scan",
+                "--config", "auto",
+                "--json",
+                "--metrics=off",
+                f"--max-memory={self.config.max_memory_mb}",
+                "--jobs=1",
+                f"--timeout={self.config.file_timeout_seconds}",
+                "--optimizations=all",
+            ] + files
+
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=self.config.chunk_timeout
+                )
+            except asyncio.TimeoutError:
+                if process.returncode is None:
+                    process.terminate()
+                    await process.wait()
+                return []
+
+            if process.returncode != 0 and process.returncode != 1:
+                logger.warning(f"Semgrep error: {stderr.decode()}")
+                return []
+
+            output = stdout.decode()
+            if not output.strip():
+                return []
+
+            return json.loads(output).get('results', [])
+
+        except Exception as e:
+            logger.error(f"Chunk scan error: {e}")
+            return []
+
+    async def _run_chunked_scan(self, target_dir: Path) -> Dict:
+        all_files = []
+        chunks = []
+        current_chunk = []
+        
+        for root, _, files in os.walk(target_dir):
+            for file in files:
+                if any(fnmatch.fnmatch(file, pattern) for pattern in self.config.exclude_patterns):
+                    self.scan_stats['files_skipped'] += 1
+                    continue
+                
+                file_path = Path(root) / file
+                try:
+                    size = file_path.stat().st_size / (1024 * 1024)  # MB
+                    if size <= self.config.max_file_size_mb:
+                        all_files.append((str(file_path), size))
+                        self.scan_stats['total_size_mb'] += size
+                    else:
+                        self.scan_stats['files_too_large'] += 1
+                except Exception as e:
+                    logger.warning(f"Error accessing {file_path}: {e}")
+        
+        all_files.sort(key=lambda x: x[1], reverse=True)
+        
+        for file_path, size in all_files:
+            if (len(current_chunk) >= self.config.max_files_per_chunk or 
+                sum(s for _, s in current_chunk) + size > self.config.chunk_size_mb):
+                if current_chunk:
+                    chunks.append([f for f, _ in current_chunk])
+                    current_chunk = []
+            current_chunk.append((file_path, size))
+        
+        if current_chunk:
+            chunks.append([f for f, _ in current_chunk])
+        
+        all_findings = []
+        self.scan_stats['total_files'] = len(all_files)
+        
+        for i, chunk in enumerate(chunks, 1):
+            logger.info(f"Processing chunk {i}/{len(chunks)} ({len(chunk)} files)")
+            findings = await self._scan_chunk(chunk)
+            all_findings.extend(findings)
+            self.scan_stats['files_processed'] += len(chunk)
+
+        return self._process_results(all_findings)
+
+    def _process_results(self, findings: List[Dict]) -> Dict:
+        severity_counts = {'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0}
+        processed_findings = []
+
+        for finding in findings:
+            severity = finding.get('extra', {}).get('severity', 'LOW').upper()
+            severity_counts[severity] = severity_counts.get(severity, 0) + 1
+            
+            processed_findings.append({
+                'id': finding.get('check_id'),
+                'file': finding.get('path', ''),
+                'line_start': finding.get('start', {}).get('line'),
+                'line_end': finding.get('end', {}).get('line'),
+                'code_snippet': finding.get('extra', {}).get('lines', ''),
+                'message': finding.get('extra', {}).get('message', ''),
+                'severity': severity,
+                'category': finding.get('extra', {}).get('metadata', {}).get('category', 'security'),
+                'cwe': finding.get('extra', {}).get('metadata', {}).get('cwe', []),
+                'owasp': finding.get('extra', {}).get('metadata', {}).get('owasp', [])
+            })
+
+        self.scan_stats['findings_count'] = len(findings)
+        self.scan_stats['memory_usage_mb'] = psutil.Process().memory_info().rss / (1024 * 1024)
+
+        return {
+            'findings': processed_findings[:100],  # Limit to 100 findings
+            'stats': {
+                'total_findings': len(findings),
+                'severity_counts': severity_counts,
+                'scan_stats': self.scan_stats
+            }
+        }
+
+    async def scan_repository(self, clone_url: str, access_token: str, default_branch: str) -> Dict:
+        try:
+            repo_dir = await self._clone_repository(clone_url, access_token, default_branch)
+            results = await self._run_chunked_scan(repo_dir)
+            
+            return {
+                'success': True,
+                'data': results,
+                'metadata': {
+                    'scan_duration': (datetime.now() - self.scan_stats['start_time']).total_seconds(),
+                    'memory_usage_mb': self.scan_stats['memory_usage_mb']
+                }}
+            
+        except Exception as e:
+            logger.error(f"Scan failed: {str(e)}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
+
 # GitLab Integration
 class GitLabIntegration:
     def __init__(self):
@@ -169,12 +409,10 @@ class GitLabIntegration:
         self._session = None
     
     async def init(self):
-        """Initialize the aiohttp session asynchronously"""
         if self._session is None:
             self._session = aiohttp.ClientSession()
 
     async def verify_token(self, access_token: str) -> UserData:
-        """Verify GitLab token and get user information"""
         if not self._session:
             await self.init()
             
@@ -203,47 +441,9 @@ class GitLabIntegration:
             )
 
     async def close(self):
-        """Clean up resources"""
         if self._session:
             await self._session.close()
         self.executor.shutdown(wait=True)
-
-    def _clone_repo_sync(self, clone_url: str, temp_dir: str, default_branch: str) -> bool:
-        """Synchronous repository cloning using GitPython"""
-        try:
-            git.Repo.clone_from(
-                clone_url,
-                temp_dir,
-                branch=default_branch,
-                depth=1,
-                single_branch=True,
-                env={
-                    'GIT_HTTP_LOW_SPEED_LIMIT': '1000',
-                    'GIT_HTTP_LOW_SPEED_TIME': '10',
-                    'GIT_ALLOC_LIMIT': '256M',
-                    'GIT_PACK_THREADS': '1'
-                }
-            )
-            return True
-        except Exception as e:
-            logger.error("clone_failed", error=str(e))
-            return False
-
-    async def clone_repository(self, clone_url: str, temp_dir: str, default_branch: str) -> bool:
-        """Asynchronous wrapper for repository cloning"""
-        try:
-            loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(
-                self.executor,
-                self._clone_repo_sync,
-                clone_url,
-                temp_dir,
-                default_branch
-            )
-            return result
-        except Exception as e:
-            logger.error("async_clone_failed", error=str(e))
-            return False
 
     async def scan_repository(
         self,
@@ -263,49 +463,43 @@ class GitLabIntegration:
                         return
                     scan.status = ScanStatus.SCANNING
                 
-                with tempfile.TemporaryDirectory(prefix='scanner_') as temp_dir:
-                    # Get repository info from GitLab
-                    async with self._session.get(
-                        f"{GITLAB_URL}/api/v4/projects/{gitlab_project_id}",
-                        headers={"Authorization": f"Bearer {access_token}"}
-                    ) as response:
-                        if response.status != 200:
-                            raise Exception("Failed to get repository info")
-                        project_data = await response.json()
-                    
-                    # Clone repository
-                    clone_url = project_data['http_url_to_repo'].replace(
-                        "https://",
-                        f"https://oauth2:{access_token}@"
+                # Get repository info from GitLab
+                async with self._session.get(
+                    f"{GITLAB_URL}/api/v4/projects/{gitlab_project_id}",
+                    headers={"Authorization": f"Bearer {access_token}"}
+                ) as response:
+                    if response.status != 200:
+                        raise Exception("Failed to get repository info")
+                    project_data = await response.json()
+
+                # Initialize scanner with configuration
+                config = GitLabScanConfig()
+                async with GitLabSecurityScanner(config) as scanner:
+                    results = await scanner.scan_repository(
+                        project_data['http_url_to_repo'],
+                        access_token,
+                        project_data['default_branch']
                     )
-                    
-                    if not await self.clone_repository(clone_url, temp_dir, project_data['default_branch']):
-                        raise Exception("Repository clone failed")
-                    
-                    # Run scan
-                    success, results, error = await self.run_semgrep_scan(temp_dir)
-                    
+
                     async with db._session.begin():
                         scan = await db._session.get(ScanResult, scan_id)
-                        if success and results:
-                            findings = results.get('results', [])[:100]
-                            
-                            severity_counts = {'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0}
-                            for finding in findings:
-                                severity = finding.get('extra', {}).get('severity', 'LOW').upper()
-                                severity_counts[severity] += 1
+                        if results['success']:
+                            findings = results['data']['findings']
+                            stats = results['data']['stats']
                             
                             scan.status = ScanStatus.COMPLETED
                             scan.findings = findings
                             scan.findings_count = len(findings)
-                            scan.critical_count = severity_counts['CRITICAL']
-                            scan.high_count = severity_counts['HIGH']
-                            scan.medium_count = severity_counts['MEDIUM']
-                            scan.low_count = severity_counts['LOW']
-                            scan.files_scanned = results.get('stats', {}).get('files_scanned', 0)
+                            scan.critical_count = stats['severity_counts']['CRITICAL']
+                            scan.high_count = stats['severity_counts']['HIGH']
+                            scan.medium_count = stats['severity_counts']['MEDIUM']
+                            scan.low_count = stats['severity_counts']['LOW']
+                            scan.files_scanned = stats['scan_stats']['files_processed']
+                            scan.files_skipped = stats['scan_stats']['files_skipped']
+                            scan.duration_seconds = results['metadata']['scan_duration']
                         else:
                             scan.status = ScanStatus.FAILED
-                            scan.error_message = error
+                            scan.error_message = str(results.get('error', 'Unknown error'))
                         
                         repo = await db._session.get(UserRepository, repo_id)
                         if repo:
@@ -318,66 +512,15 @@ class GitLabIntegration:
                     if scan:
                         scan.status = ScanStatus.FAILED
                         scan.error_message = str(e)
-                        
-    async def run_semgrep_scan(self, repo_path: str) -> tuple[bool, dict, str]:
-        """
-        Run Semgrep security scan on repository with auto configuration
-        """
-        try:
-            # Set memory and CPU limits
-            resource.setrlimit(resource.RLIMIT_AS, (MEMORY_LIMIT_MB * 1024 * 1024, MEMORY_LIMIT_MB * 1024 * 1024))
-            
-            process = await asyncio.create_subprocess_exec(
-                'semgrep',
-                'scan',
-                '--json',
-                '--config=auto',  # Use auto configuration
-                '--metrics=on', 
-                '--timeout=300',
-                '--max-memory=256',
-                '--disable-version-check',
-                '--timeout-threshold=3',
-                repo_path,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=360  # 6 minutes total timeout
-                )
-            except asyncio.TimeoutError:
-                if process.returncode is None:
-                    process.terminate()
-                    await process.wait()
-                return False, None, "Scan timed out after 6 minutes"
-            
-            if process.returncode != 0 and process.returncode != 1:
-                # returncode 1 is normal when findings are found
-                error_msg = stderr.decode().strip()
-                logger.error("semgrep_scan_failed", error=error_msg)
-                return False, None, f"Semgrep scan failed: {error_msg}"
-            
-            try:
-                results = json.loads(stdout.decode())
-                return True, results, None
-            except json.JSONDecodeError as e:
-                return False, None, f"Failed to parse Semgrep output: {str(e)}"
-                
-        except Exception as e:
-            logger.error("semgrep_scan_error", error=str(e))
-            return False, None, f"Error running Semgrep scan: {str(e)}"
 
 gitlab = GitLabIntegration()
 
-
-# Startup and shutdown
+# Event Handlers
 @app.on_event("startup")
 async def startup():
     await db.init()
     await db.create_all()
-    await gitlab.init() 
+    await gitlab.init()
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -387,7 +530,6 @@ async def shutdown():
 # Routes
 @app.get("/")
 async def root():
-    """API root with available endpoints"""
     return {
         "status": "running",
         "version": "1.0.0",
@@ -402,7 +544,6 @@ async def root():
 
 @app.get("/api/gitlab/login")
 async def gitlab_login():
-    """Start GitLab OAuth flow"""
     params = {
         'client_id': GITLAB_CLIENT_ID,
         'redirect_uri': GITLAB_REDIRECT_URI,
@@ -420,7 +561,6 @@ async def gitlab_callback(
     code: str,
     background_tasks: BackgroundTasks
 ):
-    """Handle GitLab OAuth callback"""
     try:
         # Exchange code for token
         async with aiohttp.ClientSession() as session:
@@ -523,7 +663,6 @@ async def gitlab_callback(
 
 @app.get("/api/gitlab/repos")
 async def list_repos(request: Request):
-    """List user's GitLab repositories and scan results"""
     token = request.headers.get('Authorization')
     if not token or not token.startswith('Bearer '):
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -532,7 +671,6 @@ async def list_repos(request: Request):
         user = await gitlab.verify_token(token.split()[1])
         
         async with db._session() as session:
-            # Get all active repositories for user
             stmt = select(UserRepository).where(
                 UserRepository.user_id == str(user.id),
                 UserRepository.is_active == True
@@ -542,7 +680,6 @@ async def list_repos(request: Request):
             
             results = []
             for repo in repositories:
-                # Get latest scan for each repository
                 stmt = select(ScanResult).where(
                     ScanResult.repository_id == repo.id
                 ).order_by(ScanResult.scan_date.desc()).limit(1)
@@ -592,7 +729,6 @@ async def list_repos(request: Request):
 
 @app.get("/api/gitlab/scan/{scan_id}/status", response_model=ScanStatusResponse)
 async def get_scan_status(scan_id: int, request: Request):
-    """Get the status of a specific scan"""
     token = request.headers.get('Authorization')
     if not token or not token.startswith('Bearer '):
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -625,13 +761,10 @@ async def get_scan_status(scan_id: int, request: Request):
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
     try:
-        # Verify database connection
         async with db._session() as session:
             await session.execute(select(1))
         
-        # Verify semgrep installation
         process = await asyncio.create_subprocess_exec(
             'semgrep',
             '--version',
@@ -655,13 +788,10 @@ async def health_check():
             }
         )
 
-
 # Signal handlers
 async def shutdown_signal_handler():
-    """Handle shutdown signals gracefully"""
     logger.info("initiating_graceful_shutdown")
     
-    # Get all running tasks
     running_tasks = [
         task for task in asyncio.all_tasks()
         if task is not asyncio.current_task() 
@@ -672,26 +802,22 @@ async def shutdown_signal_handler():
     if running_tasks:
         logger.info(f"waiting_for_{len(running_tasks)}_scans_to_complete")
         
-        # Wait for running scans with timeout
         try:
             await asyncio.wait_for(
                 asyncio.gather(*running_tasks, return_exceptions=True),
-                timeout=300  # 5 minute timeout for scans to complete
+                timeout=300
             )
         except asyncio.TimeoutError:
             logger.warning("some_scans_did_not_complete_in_time")
-            
-            # Cancel remaining tasks
             for task in running_tasks:
                 if not task.done():
                     task.cancel()
     
-    # Cancel any other tasks
     other_tasks = [
         task for task in asyncio.all_tasks()
         if task is not asyncio.current_task() 
         and not task.done()
-        and 'scan_repository' not in str(task.get_coro())
+        and 'scan_repository' not in str(task.get.get_coro())
     ]
     
     for task in other_tasks:
@@ -707,9 +833,66 @@ async def shutdown_signal_handler():
     logger.info("shutdown_complete")
 
 def handle_signals():
+    """Configure signal handlers for graceful shutdown"""
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(
             sig,
             lambda s=sig: asyncio.create_task(shutdown_signal_handler())
         )
+
+# Error Handlers
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "success": False,
+            "error": {
+                "code": exc.status_code,
+                "message": exc.detail
+            }
+        }
+    )
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Unhandled exception: {str(exc)}")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "success": False,
+            "error": {
+                "code": 500,
+                "message": "Internal server error",
+                "detail": str(exc)
+            }
+        }
+    )
+
+# Main entry point
+if __name__ == "__main__":
+    import uvicorn
+    
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    # Setup signal handlers
+    handle_signals()
+    
+    # Run the application
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        workers=4,
+        loop="asyncio",
+        log_level="info",
+        access_log=True,
+        timeout_keep_alive=65,
+        proxy_headers=True
+    )
