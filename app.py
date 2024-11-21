@@ -341,7 +341,7 @@ class GitLabIntegration:
                 '--config=auto',
                 '--timeout=300',
                 '--max-memory=256',
-                '--metrics=off',
+                '--metrics=on',
                 '--disable-version-check',  
                 '--timeout-threshold=3',
                 repo_path,
