@@ -1,28 +1,45 @@
-import multiprocessing
-import os
+# Number of worker processes
+workers = 2
 
-# Server socket
-bind = f"0.0.0.0:{os.getenv('PORT', '8000')}"
+# Worker class to use
+worker_class = 'uvicorn.workers.UvicornWorker'
 
-# Worker processes
-workers = int(os.getenv('WEB_CONCURRENCY', multiprocessing.cpu_count() * 2 + 1))
-worker_class = "uvicorn.workers.UvicornWorker"
+# Maximum number of requests a worker will process before restarting
+max_requests = 1000
+max_requests_jitter = 50
 
-# Timeout
-timeout = 120
+# Maximum memory (in bytes) that can be used by each worker (256MB)
+max_worker_memory = 256 * 1024 * 1024
+
+# Timeout settings
+graceful_timeout = 30
+timeout = 30
+
+# Log configuration
+loglevel = 'info'
+accesslog = '-'
+access_log_format = '%(h)s %(l)s %(u)s %(t)s "%(r)s" %(s)s %(b)s "%(f)s" "%(a)s"'
+
+# Process name
+proc_name = 'gitlab-scanner'
+
+# Pre-fork hook for memory limits
+def pre_fork(server, worker):
+    import resource
+    resource.setrlimit(resource.RLIMIT_AS, (max_worker_memory, max_worker_memory))
+
+# Keep-alive settings
 keepalive = 5
 
-# Server mechanics
-daemon = False
-raw_env = [f"APP_ENV={os.getenv('APP_ENV', 'production')}"]
-pidfile = None
-umask = 0
-user = None
-group = None
-tmp_upload_dir = None
+# Worker connections
+worker_connections = 1000
 
-# Logging
-accesslog = "-"
-errorlog = "-"
-loglevel = os.getenv('LOG_LEVEL', 'info')
-access_log_format = '%(h)s %(l)s %(u)s %(t)s "%(r)s" %(s)s %(b)s "%(f)s" "%(a)s"'
+# Prevent worker timeout
+timeout = 300
+
+# Thread configuration
+threads = 4
+
+# Reduce worker spawning
+max_requests = 1000
+max_requests_jitter = 50

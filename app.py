@@ -603,14 +603,3 @@ def handle_signals():
             lambda s=sig: asyncio.create_task(shutdown_signal_handler())
         )
 
-if __name__ == "__main__":
-    handle_signals()
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8000,
-        workers=4,
-        loop="asyncio",
-        log_level="info",
-        access_log=True
-    )
