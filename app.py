@@ -625,21 +625,26 @@ async def root():
         ]
     }
 
-@app.get("/api/gitlab/login")
-async def gitlab_login(user_id: str):  # Simplified parameter
-    """Start GitLab OAuth flow using provided user ID"""
+
+
+class UserIDRequest(BaseModel):
+    user_id: str
+
+@app.post("/api/gitlab/login")
+async def gitlab_login_post(request: UserIDRequest):
+    """Start GitLab OAuth flow using POST request with user ID"""
     params = {
         'client_id': GITLAB_CLIENT_ID,
         'redirect_uri': GITLAB_REDIRECT_URI,
         'response_type': 'code',
         'scope': 'api read_user read_repository',
-        'state': user_id  # Simply pass the user_id as state
+        'state': request.user_id
     }
     
     authorize_url = f"{GITLAB_URL}/oauth/authorize"
     query_string = "&".join(f"{k}={v}" for k, v in params.items())
     
-    return RedirectResponse(f"{authorize_url}?{query_string}")
+    return RedirectResponse(f"{authorize_url}?{query_string}", status_code=307)
 
 
 @app.get("/api/gitlab/oauth/callback")
