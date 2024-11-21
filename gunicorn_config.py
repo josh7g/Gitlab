@@ -1,20 +1,28 @@
 import multiprocessing
 import os
 
-# Gunicorn config
+# Server socket
 bind = f"0.0.0.0:{os.getenv('PORT', '8000')}"
-workers = multiprocessing.cpu_count() * 2 + 1
+
+# Worker processes
+workers = int(os.getenv('WEB_CONCURRENCY', multiprocessing.cpu_count() * 2 + 1))
 worker_class = "uvicorn.workers.UvicornWorker"
+
+# Timeout
 timeout = 120
 keepalive = 5
-max_requests = 1000
-max_requests_jitter = 50
-log_level = "info"
 
-# SSL config (if needed)
-keyfile = os.getenv("SSL_KEYFILE", None)
-certfile = os.getenv("SSL_CERTFILE", None)
+# Server mechanics
+daemon = False
+raw_env = [f"APP_ENV={os.getenv('APP_ENV', 'production')}"]
+pidfile = None
+umask = 0
+user = None
+group = None
+tmp_upload_dir = None
 
 # Logging
 accesslog = "-"
 errorlog = "-"
+loglevel = os.getenv('LOG_LEVEL', 'info')
+access_log_format = '%(h)s %(l)s %(u)s %(t)s "%(r)s" %(s)s %(b)s "%(f)s" "%(a)s"'

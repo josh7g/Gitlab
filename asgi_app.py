@@ -1,4 +1,9 @@
-from app import app
+import os
+from dotenv import load_dotenv
+from app import app as fastapi_app
 
-# This is the ASGI application to be used by Gunicorn
-asgi_app = app
+# Load environment variables
+load_dotenv()
+
+# This is the ASGI application
+asgi_app = fastapi_app

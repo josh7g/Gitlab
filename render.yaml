@@ -2,8 +2,10 @@ services:
   - type: web
     name: gitlab-scanner
     env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn asgi_app:asgi_app -c gunicorn_config.py
+    buildCommand: |
+      python -m pip install --upgrade pip
+      pip install -r requirements.txt
+    startCommand: gunicorn -k uvicorn.workers.UvicornWorker asgi_app:asgi_app -c gunicorn_config.py
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0

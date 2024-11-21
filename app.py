@@ -19,6 +19,7 @@ from typing import Optional, List, Dict, Any
 from pydantic import BaseModel
 import git
 import asyncio
+import aiohttp  
 from concurrent.futures import ThreadPoolExecutor
 
 # Configure logging
@@ -27,6 +28,16 @@ logging.basicConfig(level=logging.INFO)
 
 # Initialize FastAPI app
 app = FastAPI(title="GitLab Security Scanner")
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 
 # Constants
@@ -153,13 +164,21 @@ db = AsyncDatabaseSession()
 class GitLabIntegration:
     def __init__(self):
         self.scan_semaphore = asyncio.Semaphore(2)
-        self._session = aiohttp.ClientSession()
         self.executor = ThreadPoolExecutor(max_workers=4)
+        
+        self._session = None
+    
+    async def init(self):
+        """Initialize the aiohttp session asynchronously"""
+        if self._session is None:
+            self._session = aiohttp.ClientSession()
 
     async def close(self):
+        """Clean up resources"""
         if self._session:
             await self._session.close()
         self.executor.shutdown(wait=True)
+
 
     def _clone_repo_sync(self, clone_url: str, temp_dir: str, default_branch: str) -> bool:
         """Synchronous repository cloning using GitPython"""
@@ -274,22 +293,13 @@ class GitLabIntegration:
 
 gitlab = GitLabIntegration()
 
-# FastAPI app
-app = FastAPI(title="GitLab Security Scanner")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # Startup and shutdown
 @app.on_event("startup")
 async def startup():
     await db.init()
     await db.create_all()
+    await gitlab.init() 
 
 @app.on_event("shutdown")
 async def shutdown():
