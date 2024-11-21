@@ -336,12 +336,13 @@ class GitLabIntegration:
             # Create process with timeout
             process = await asyncio.create_subprocess_exec(
                 'semgrep',
+                'scan',  # Add 'scan' subcommand
                 '--json',
                 '--config=auto',
                 '--timeout=300',
                 '--max-memory=256',
                 '--metrics=off',
-                '--enable-version-check=no',
+                '--disable-version-check',  
                 '--timeout-threshold=3',
                 repo_path,
                 stdout=asyncio.subprocess.PIPE,
