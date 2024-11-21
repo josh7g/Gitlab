@@ -264,7 +264,7 @@ class GitLabSecurityScanner:
                 "scan",
                 "--config", "auto",
                 "--json",
-                "--metrics=off",
+                "--metrics=on",
                 f"--max-memory={self.config.max_memory_mb}",
                 "--jobs=1",
                 f"--timeout={self.config.file_timeout_seconds}",
