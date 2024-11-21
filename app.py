@@ -625,12 +625,14 @@ async def root():
     }
 
 @app.get("/api/gitlab/login")
-async def gitlab_login():
+async def gitlab_login(user_id: str = Query(..., description="User ID")):
+    """Start GitLab OAuth flow using provided user ID"""
     params = {
         'client_id': GITLAB_CLIENT_ID,
         'redirect_uri': GITLAB_REDIRECT_URI,
         'response_type': 'code',
-        'scope': 'api read_user read_repository'
+        'scope': 'api read_user read_repository',
+        'state': user_id  # Simply pass the user_id as state
     }
     
     authorize_url = f"{GITLAB_URL}/oauth/authorize"
@@ -641,9 +643,13 @@ async def gitlab_login():
 @app.get("/api/gitlab/oauth/callback")
 async def gitlab_callback(
     code: str,
+    state: str,
     background_tasks: BackgroundTasks
 ):
+    """Handle GitLab OAuth callback"""
     try:
+        user_id = state  # Get the user_id directly from state
+        
         # Exchange code for token
         async with aiohttp.ClientSession() as session:
             token_response = await session.post(
@@ -662,13 +668,10 @@ async def gitlab_callback(
                 raise HTTPException(status_code=400, detail=token_data['error'])
             
             access_token = token_data['access_token']
+            gitlab_user = await gitlab.verify_token(access_token)
             
-            # Get user info
-            user = await gitlab.verify_token(access_token)
-            
-            # Connect account and start scans
+            # Rest of your existing code using the provided user_id
             async with db._session.begin():
-                # Get user's GitLab projects
                 async with aiohttp.ClientSession() as session:
                     projects_response = await session.get(
                         f"{GITLAB_URL}/api/v4/projects?owned=true",
@@ -678,9 +681,8 @@ async def gitlab_callback(
                 
                 processed_repos = []
                 for project in projects:
-                    # Check if repository exists
                     stmt = select(UserRepository).where(
-                        UserRepository.user_id == str(user.id),
+                        UserRepository.user_id == user_id,
                         UserRepository.gitlab_project_id == project['id']
                     )
                     result = await db._session.execute(stmt)
@@ -691,7 +693,7 @@ async def gitlab_callback(
                         repo.repository_url = project['web_url']
                     else:
                         repo = UserRepository(
-                            user_id=str(user.id),
+                            user_id=user_id,  
                             gitlab_project_id=project['id'],
                             repository_name=project['name'],
                             repository_url=project['web_url'],
@@ -704,7 +706,7 @@ async def gitlab_callback(
                     
                     scan = ScanResult(
                         repository_id=repo.id,
-                        user_id=str(user.id),
+                        user_id=user_id,  
                         status=ScanStatus.PENDING,
                         branch=project['default_branch'],
                         scan_date=datetime.utcnow()
@@ -719,10 +721,9 @@ async def gitlab_callback(
                         'scan_id': scan.id
                     })
                     
-                    # Schedule scan
                     background_tasks.add_task(
                         gitlab.scan_repository,
-                        user_id=str(user.id),
+                        user_id=user_id,
                         repo_id=repo.id,
                         access_token=access_token,
                         gitlab_project_id=project['id'],
@@ -734,8 +735,8 @@ async def gitlab_callback(
                 'message': f'Successfully connected GitLab account and initiated scans for {len(processed_repos)} repositories',
                 'repositories': processed_repos,
                 'user': {
-                    'id': user.id,
-                    'username': user.username
+                    'id': user_id,
+                    'gitlab_username': gitlab_user.username
                 }
             })
             
