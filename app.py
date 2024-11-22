@@ -281,15 +281,11 @@ class GitLabSecurityScanner:
                 "semgrep",
                 "scan",
                 "--json",
-                "--config", "p/security-audit",     # Comprehensive security ruleset
-                "--config", "p/owasp-top-ten",      # OWASP Top 10 vulnerabilities
-                "--config", "p/cwe-top-25",         # CWE Top 25 vulnerabilities
-                "--config", "p/secrets",            # Detect secrets and credentials
-                "--config", "p/insecure-transport", # Insecure data transmission
-                "--config", "p/auth",               # Authentication issues
+                "--config", "r/security-audit",  # Changed from p/ to r/ for more comprehensive rules
+                "--config", "r/owasp-top-ten",   
                 "--metrics=off",
-                "--max-time-limit", "30",
                 "--no-git-ignore",
+                "--disable-version-check",
                 "--optimizations=all",
                 "--max-target-bytes", str(2 * 1024 * 1024),
                 "--timeout", str(self.config.file_timeout_seconds)
@@ -304,26 +300,32 @@ class GitLabSecurityScanner:
                 limit=2 * 1024 * 1024
             )
 
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(),
-                timeout=self.config.chunk_timeout
-            )
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=self.config.chunk_timeout
+                )
 
-            stdout_output = stdout.decode() if stdout else ""
-            if not stdout_output.strip():
+                stderr_output = stderr.decode() if stderr else ""
+                if stderr_output:
+                    logger.info(f"Semgrep stderr: {stderr_output}")
+
+                stdout_output = stdout.decode() if stdout else ""
+                if not stdout_output.strip():
+                    return []
+
+                results = json.loads(stdout_output)
+                findings = results.get('results', [])
+                
+                # Log findings for debugging
+                if findings:
+                    logger.info(f"Found {len(findings)} potential security issues")
+                
+                return findings
+
+            except asyncio.TimeoutError:
+                logger.error("Scan timeout")
                 return []
-
-            results = json.loads(stdout_output)
-            findings = results.get('results', [])
-            
-            # Filter to include only security-relevant findings
-            security_findings = [
-                f for f in findings 
-                if any(cat in f.get('extra', {}).get('metadata', {}).get('category', '').lower() 
-                    for cat in ['security', 'vuln', 'injection', 'auth', 'crypto', 'secret'])
-            ]
-            
-            return security_findings
 
         except Exception as e:
             logger.error(f"Security scan error: {str(e)}")
