@@ -225,39 +225,89 @@ class GitLabSecurityScanner:
             logger.error(f"Error during cleanup: {str(e)}")
 
     async def _clone_repository(self, clone_url: str, access_token: str, default_branch: str) -> Path:
+        """Clone repository with optimized resource usage and better error handling"""
         try:
             self.repo_dir = self.temp_dir / f"repo_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             auth_url = clone_url.replace('https://', f'https://oauth2:{access_token}@')
             
             logger.info(f"Cloning repository to {self.repo_dir}")
             
+            # Reduce resource usage during clone
+            env = {
+                'GIT_HTTP_LOW_SPEED_LIMIT': '1000',
+                'GIT_HTTP_LOW_SPEED_TIME': '10',
+                'GIT_ALLOC_LIMIT': '256M',
+                'GIT_PACK_THREADS': '1',
+                'GIT_HTTP_MAX_REQUEST_BUFFER': '100M',
+                'GIT_TRACE_PACKET': '0',
+                'GIT_TRACE': '0',
+                'GIT_CURL_VERBOSE': '0'
+            }
+            
+            # Split the clone into multiple steps for better control
+            os.makedirs(self.repo_dir, exist_ok=True)
+            
+            # Initialize repository
+            repo = git.Repo.init(self.repo_dir)
+            
+            # Add remote
+            origin = repo.create_remote('origin', auth_url)
+            
+            # Fetch specific branch with limited history
             git_options = [
+                '-c', 'protocol.version=2',  # Use protocol v2 for better performance
+                '-c', 'pack.threads=1',      # Limit pack threads
+                '-c', 'pack.windowMemory=100m', # Limit memory usage
+                'fetch',
+                'origin',
+                default_branch,
                 '--depth=1',
-                '--single-branch',
                 '--no-tags',
-                f'--branch={default_branch}',
-                '--filter=blob:none'
+                '--filter=blob:none',
+                '--no-recurse-submodules'
             ]
             
-            repo = git.Repo.clone_from(
-                auth_url,
-                self.repo_dir,
-                multi_options=git_options,
-                env={
-                    'GIT_HTTP_LOW_SPEED_LIMIT': '1000',
-                    'GIT_HTTP_LOW_SPEED_TIME': '10',
-                    'GIT_ALLOC_LIMIT': '256M',
-                    'GIT_PACK_THREADS': '1'
-                }
+            # Execute fetch command
+            fetch_process = await asyncio.create_subprocess_exec(
+                'git',
+                *git_options,
+                cwd=str(self.repo_dir),
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
             )
-
+            
+            stdout, stderr = await fetch_process.communicate()
+            
+            if fetch_process.returncode != 0:
+                raise Exception(f"Fetch failed: {stderr.decode()}")
+            
+            # Checkout the fetched branch
+            repo.git.checkout('FETCH_HEAD', '-f')
+            
+            logger.info(f"Successfully cloned repository to {self.repo_dir}")
             return self.repo_dir
 
         except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Repository clone failed: {error_msg}")
             if self.repo_dir and self.repo_dir.exists():
                 shutil.rmtree(self.repo_dir)
-            raise RuntimeError(f"Repository clone failed: {str(e)}") from e
-
+            
+            # Check for specific error conditions and provide more detail
+            if "unable to create thread" in error_msg:
+                raise RuntimeError(
+                    "System resource limit reached. The server is temporarily unable to process "
+                    "the request due to resource constraints. Please try again in a few minutes."
+                )
+            elif "could not fetch" in error_msg:
+                raise RuntimeError(
+                    "Failed to fetch repository data. This might be due to network issues "
+                    "or repository access permissions. Please verify the repository URL and permissions."
+                )
+            else:
+                raise RuntimeError(f"Repository clone failed: {error_msg}")
+            
     async def _scan_chunk(self, files: List[str]) -> List[Dict]:
         """Scan a single chunk of files using Semgrep comprehensive rulesets"""
         try:
