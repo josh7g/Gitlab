@@ -5,7 +5,7 @@ services:
     buildCommand: |
       python -m pip install --upgrade pip
       pip install -r requirements.txt
-    startCommand: gunicorn -k uvicorn.workers.UvicornWorker asgi_app:asgi_app -c gunicorn_config.py --preload --bind 0.0.0.0:$PORT
+    startCommand: gunicorn -k uvicorn.workers.UvicornWorker asgi_app:asgi_app -c gunicorn_config.py --preload
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0

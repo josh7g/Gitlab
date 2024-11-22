@@ -1,3 +1,7 @@
+# Import required modules
+import os
+import logging
+
 # Number of worker processes for Render's free tier
 workers = 2
 
@@ -34,12 +38,10 @@ def pre_fork(server, worker):
             resource.setrlimit(resource.RLIMIT_AS, (max_worker_memory, hard))
     except Exception as e:
         # Log but don't fail if we can't set limits
-        import logging
         logging.warning(f"Could not set memory limits: {e}")
     
     # Set nice value for CPU priority
     try:
-        import os
         os.nice(10)
     except Exception:
         pass
