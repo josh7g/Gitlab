@@ -227,10 +227,12 @@ class GitLabSecurityScanner:
             logger.error(f"Error during cleanup: {str(e)}")
 
     async def _clone_repository(self, clone_url: str, access_token: str, default_branch: str) -> Path:
-        """Clone repository without using resource limits"""
+        """Clone repository with direct git clone"""
         try:
             self.repo_dir = self.temp_dir / f"repo_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            os.makedirs(self.repo_dir, exist_ok=True)
+            auth_url = clone_url.replace('https://', f'https://oauth2:{access_token}@')
+            
+            logger.info(f"Cloning repository to {self.repo_dir}")
             
             env = {
                 'GIT_HTTP_LOW_SPEED_LIMIT': '500',
@@ -239,69 +241,32 @@ class GitLabSecurityScanner:
                 'GIT_TRACE_PACKET': '0',
                 'GIT_TRACE': '0',
                 'GIT_CURL_VERBOSE': '0',
-                'GIT_DISCOVERY_ACROSS_FILESYSTEM': '0',
-                'GIT_CONFIG_NOSYSTEM': '1',
-                'GIT_FLUSH': '1'
             }
 
-            # Initialize repository
-            await asyncio.create_subprocess_shell(
-                f"git init {self.repo_dir}",
-                env=env
-            )
-
-            # Configure sparse checkout
-            config_commands = [
-                f"cd {self.repo_dir}",
-                "git config core.sparsecheckout true",
-                "echo '/*' > .git/info/sparse-checkout",
-                "git config --local gc.auto 0",
-                f"git remote add origin {clone_url.replace('https://', f'https://oauth2:{access_token}@')}"
+            # Direct clone with minimal history
+            cmd = [
+                'git', 'clone',
+                '--depth=1',
+                '--single-branch',
+                '--no-tags',
+                f'--branch={default_branch}',
+                '--filter=blob:none',
+                '--quiet',
+                auth_url,
+                str(self.repo_dir)
             ]
-            
-            for cmd in config_commands:
-                process = await asyncio.create_subprocess_shell(
-                    cmd,
-                    env=env,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                await process.communicate()
 
-            # Fetch only the tip of the branch
-            fetch_cmd = (
-                f"cd {self.repo_dir} && "
-                f"git -c protocol.version=2 fetch --depth=1 --no-tags --filter=blob:none "
-                f"origin {default_branch}:refs/remotes/origin/{default_branch}"
-            )
-
-            process = await asyncio.create_subprocess_shell(
-                fetch_cmd,
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
                 env=env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
 
             stdout, stderr = await process.communicate()
-            if process.returncode != 0:
-                raise Exception(f"Fetch failed: {stderr.decode()}")
-
-            # Checkout the branch
-            checkout_cmd = (
-                f"cd {self.repo_dir} && "
-                f"git checkout -f -B {default_branch} refs/remotes/origin/{default_branch}"
-            )
             
-            process = await asyncio.create_subprocess_shell(
-                checkout_cmd,
-                env=env,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            
-            stdout, stderr = await process.communicate()
             if process.returncode != 0:
-                raise Exception(f"Checkout failed: {stderr.decode()}")
+                raise Exception(f"Clone failed: {stderr.decode()}")
 
             return self.repo_dir
 
@@ -309,7 +274,6 @@ class GitLabSecurityScanner:
             if self.repo_dir and self.repo_dir.exists():
                 shutil.rmtree(self.repo_dir)
             raise Exception(f"Clone failed: {str(e)}")
-
 
             
     async def _scan_chunk(self, files: List[str]) -> List[Dict]:
