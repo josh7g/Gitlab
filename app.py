@@ -283,18 +283,13 @@ class GitLabSecurityScanner:
                 "semgrep",
                 "scan",
                 "--json",
-                "--config", "p/security-audit",    
-                "--config", "p/owasp-top-ten",     
-                "--config", "p/ci",                
-                "--config", "p/secrets",           
-                "--config", "p/auth",              
-                "--config", "p/insecure-transport",
+                "--config", "auto",    
                 "--metrics=off",
                 "--optimizations=all",
                 "--timeout", str(self.config.file_timeout_seconds),
                 "--max-target-bytes", str(5 * 1024 * 1024),
                 "--timeout-threshold", "2",
-                "--severity", "INFO"  # Changed to single severity - will include all levels INFO and above
+                  # Changed to single severity - will include all levels INFO and above
             ] + files
 
             logger.info(f"Starting scan with {len(files)} files using comprehensive ruleset")
