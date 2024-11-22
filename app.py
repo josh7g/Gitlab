@@ -58,21 +58,19 @@ ASYNC_DATABASE_URL = DATABASE_URL.replace('postgresql://', 'postgresql+asyncpg:/
 # Scanner Configuration
 @dataclass
 class GitLabScanConfig:
-    """Configuration for GitLab repository scanning without resource limits"""
+    """Configuration optimized for Render free tier"""
     def __init__(self):
-        self.max_file_size_mb = 5
-        self.max_total_size_mb = 50
-        self.chunk_size_mb = 10
-        self.max_files_per_chunk = 20
-        
-        # Timeouts
-        self.timeout_seconds = 180
-        self.chunk_timeout = 60
-        self.file_timeout_seconds = 10
-        
+        self.max_file_size_mb = 2
+        self.max_total_size_mb = 20
+        self.chunk_size_mb = 5
+        self.max_files_per_chunk = 10
+        self.timeout_seconds = 60
+        self.chunk_timeout = 30
+        self.file_timeout_seconds = 5
         self.max_retries = 1
         self.concurrent_processes = 1
         
+   
         self.exclude_patterns = [
             '.git', '.svn', 'node_modules', 'vendor',
             'bower_components', 'packages', 'dist',
@@ -277,72 +275,58 @@ class GitLabSecurityScanner:
 
             
     async def _scan_chunk(self, files: List[str]) -> List[Dict]:
-        """Scan a chunk of files with comprehensive security rules"""
+        """Scan files focusing on security issues"""
         try:
             cmd = [
                 "semgrep",
                 "scan",
                 "--json",
-                "--config", "p/security-audit",    
+                "--config", "p/security-audit",     # Comprehensive security ruleset
+                "--config", "p/owasp-top-ten",      # OWASP Top 10 vulnerabilities
+                "--config", "p/cwe-top-25",         # CWE Top 25 vulnerabilities
+                "--config", "p/secrets",            # Detect secrets and credentials
+                "--config", "p/insecure-transport", # Insecure data transmission
+                "--config", "p/auth",               # Authentication issues
                 "--metrics=off",
+                "--max-time-limit", "30",
+                "--no-git-ignore",
                 "--optimizations=all",
-                "--timeout", str(self.config.file_timeout_seconds),
-                "--max-target-bytes", str(5 * 1024 * 1024),
-                "--timeout-threshold", "2",
-                  # Changed to single severity - will include all levels INFO and above
+                "--max-target-bytes", str(2 * 1024 * 1024),
+                "--timeout", str(self.config.file_timeout_seconds)
             ] + files
 
-            logger.info(f"Starting scan with {len(files)} files using comprehensive ruleset")
-
+            logger.info(f"Starting security scan with {len(files)} files")
+            
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                limit=5 * 1024 * 1024
+                limit=2 * 1024 * 1024
             )
 
-            try:
-                stdout, stderr = await process.communicate()
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=self.config.chunk_timeout
+            )
 
-                stdout_output = stdout.decode() if stdout else ""
-                stderr_output = stderr.decode() if stderr else ""
-
-                if stderr_output and "error: missing required key" in stderr_output.lower():
-                    logger.warning("Some rulesets unavailable, falling back to basic security scan")
-                    return await self._fallback_scan(files)
-
-                if not stdout_output.strip():
-                    return []
-
-                results = json.loads(stdout_output)
-                findings = results.get('results', [])
-                
-                if findings:
-                    severities = {}
-                    categories = {}
-                    for finding in findings:
-                        sev = finding.get('extra', {}).get('severity', 'unknown')
-                        cat = finding.get('extra', {}).get('metadata', {}).get('category', 'unknown')
-                        severities[sev] = severities.get(sev, 0) + 1
-                        categories[cat] = categories.get(cat, 0) + 1
-                    
-                    logger.info(
-                        f"Found {len(findings)} issues\n"
-                        f"Severities: {severities}\n"
-                        f"Categories: {categories}"
-                    )
-                
-                return findings
-
-            except asyncio.TimeoutError:
-                if process.returncode is None:
-                    process.terminate()
-                    await process.wait()
-                logger.warning(f"Scan timeout for chunk with {len(files)} files")
+            stdout_output = stdout.decode() if stdout else ""
+            if not stdout_output.strip():
                 return []
 
+            results = json.loads(stdout_output)
+            findings = results.get('results', [])
+            
+            # Filter to include only security-relevant findings
+            security_findings = [
+                f for f in findings 
+                if any(cat in f.get('extra', {}).get('metadata', {}).get('category', '').lower() 
+                    for cat in ['security', 'vuln', 'injection', 'auth', 'crypto', 'secret'])
+            ]
+            
+            return security_findings
+
         except Exception as e:
-            logger.error(f"Chunk scan error: {str(e)}")
+            logger.error(f"Security scan error: {str(e)}")
             return []
 
     async def _fallback_scan(self, files: List[str]) -> List[Dict]:
