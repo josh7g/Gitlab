@@ -1,3 +1,4 @@
+# render.yaml
 services:
   - type: web
     name: gitlab-scanner
@@ -5,7 +6,7 @@ services:
     buildCommand: |
       python -m pip install --upgrade pip
       pip install -r requirements.txt
-    startCommand: gunicorn -k uvicorn.workers.UvicornWorker asgi_app:asgi_app -c gunicorn_config.py
+    startCommand: gunicorn -k uvicorn.workers.UvicornWorker asgi_app:asgi_app -c gunicorn_config.py --preload
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
@@ -17,5 +18,35 @@ services:
         sync: false
       - key: GITLAB_REDIRECT_URI
         sync: false
+      # Added resource control environment variables
+      - key: MAX_WORKERS
+        value: "2"
+      - key: WEB_CONCURRENCY
+        value: "2"
+      - key: PYTHON_OPTIMIZE
+        value: "2"
+      - key: PYTHONMALLOCSTATS
+        value: "0"
+      - key: PYTHONHASHSEED
+        value: "random"
+      - key: MALLOC_TRIM_THRESHOLD_
+        value: "65536"
     healthCheckPath: /health
     autoDeploy: true
+    # Added resource limits
+    scaling:
+      minInstances: 1
+      maxInstances: 1
+    resources:
+      cpu: 0.5
+      memory: 512
+    # Added startup probe
+    startupProbe:
+      httpGet:
+        path: /health
+        port: 10000
+      initialDelaySeconds: 10
+      periodSeconds: 5
+      timeoutSeconds: 2
+      successThreshold: 1
+      failureThreshold: 3
