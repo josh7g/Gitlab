@@ -259,25 +259,31 @@ class GitLabSecurityScanner:
             raise RuntimeError(f"Repository clone failed: {str(e)}") from e
 
     async def _scan_chunk(self, files: List[str]) -> List[Dict]:
-        """Scan a single chunk of files using Semgrep registry rules"""
+        """Scan a single chunk of files using Semgrep comprehensive rulesets"""
         try:
             cmd = [
                 "semgrep",
                 "scan",
                 "--json",
-                "--config", "p/ci",  # Changed back to p/ci from auto
-                "--metrics=off",     # Explicitly disable metrics
+                "--config", "p/security-audit",  # Changed to security-audit ruleset for broader coverage
+                "--config", "p/owasp-top-ten",   # Added OWASP Top 10 ruleset
+                "--metrics=off",
                 f"--max-memory={self.config.max_memory_mb}",
                 "--optimizations=all",
                 "--timeout", str(self.config.file_timeout_seconds),
-              
+                "--severity", "INFO",
+                "--max-target-bytes", str(25 * 1024 * 1024),
+                "--timeout-threshold", "3",
+                "--no-git-ignore",  # Scan all files, not just git tracked ones
+                "--enable-metrics",  # Enable detailed metrics for better findings
+                "--verbose"  # Add verbose output for debugging
             ] + files
 
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                limit=1024 * 1024 * 10  # 10MB buffer for output
+                limit=1024 * 1024 * 10
             )
 
             try:
@@ -292,49 +298,55 @@ class GitLabSecurityScanner:
                 logger.warning(f"Scan timeout for chunk with {len(files)} files")
                 return []
 
-            # Handle semgrep output
             stdout_output = stdout.decode() if stdout else ""
             stderr_output = stderr.decode() if stderr else ""
 
-            # Log errors that aren't just informational
-            if stderr_output and not any(x in stderr_output.lower() for x in ['metrics:', 'running autofix', 'scan status']):
-                logger.warning(f"Semgrep stderr: {stderr_output}")
+            # Log all stderr output for debugging
+            if stderr_output:
+                logger.info(f"Semgrep stderr output: {stderr_output}")
 
-            if process.returncode not in [0, 1, 2]:  # Added 2 as acceptable return code
+            # Accept more return codes as valid
+            if process.returncode not in [0, 1, 2, 3]:
                 logger.error(f"Semgrep exited with code {process.returncode}")
                 if stderr_output:
                     logger.error(f"Error details: {stderr_output}")
                 return []
 
             if not stdout_output.strip():
+                logger.warning("No output from Semgrep scan")
                 return []
 
             try:
                 results = json.loads(stdout_output)
                 findings = results.get('results', [])
                 
-                # Enhanced logging
+                # Enhanced logging with detailed metrics
                 if findings:
                     severities = {}
+                    categories = {}
                     for finding in findings:
                         sev = finding.get('extra', {}).get('severity', 'unknown')
+                        cat = finding.get('extra', {}).get('metadata', {}).get('category', 'unknown')
                         severities[sev] = severities.get(sev, 0) + 1
+                        categories[cat] = categories.get(cat, 0) + 1
                     
                     logger.info(
-                        f"Scan completed: {len(findings)} findings "
-                        f"({', '.join(f'{k}: {v}' for k, v in severities.items())})"
+                        f"Scan completed: {len(findings)} findings\n"
+                        f"Severities: {severities}\n"
+                        f"Categories: {categories}"
                     )
                 else:
-                    logger.info("Scan completed: No findings")
+                    logger.warning("Scan completed: No findings - this might indicate a configuration issue")
                 
                 return findings
 
             except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse Semgrep output: {str(e)}")
+                logger.error(f"Failed to parse Semgrep output: {str(e)}\nOutput was: {stdout_output[:1000]}")
                 return []
 
         except Exception as e:
             logger.error(f"Error during chunk scan: {str(e)}")
+            logger.exception("Full exception details:")
             return []
 
     def _process_results(self, findings: List[Dict]) -> Dict:
