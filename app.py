@@ -632,20 +632,40 @@ class UserIDRequest(BaseModel):
 
 @app.post("/api/gitlab/login")
 async def gitlab_login_post(request: UserIDRequest):
-    """Start GitLab OAuth flow using POST request with user ID"""
+    """Handle POST request for GitLab login"""
+    try:
+        params = {
+            'client_id': GITLAB_CLIENT_ID,
+            'redirect_uri': GITLAB_REDIRECT_URI,
+            'response_type': 'code',
+            'scope': 'read_user read_repository api',
+            'state': request.user_id  # This will be your database user ID
+        }
+        
+        authorize_url = f"{GITLAB_URL}/oauth/authorize"
+        query_string = "&".join(f"{k}={v}" for k, v in params.items())
+        full_url = f"{authorize_url}?{query_string}"
+        
+        return {"redirect_url": full_url}
+    except Exception as e:
+        logger.error(f"GitLab login failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/gitlab/login")
+async def gitlab_login_get(user_id: str):
+    """Handle GET request for GitLab login"""
     params = {
         'client_id': GITLAB_CLIENT_ID,
         'redirect_uri': GITLAB_REDIRECT_URI,
         'response_type': 'code',
-        'scope': 'api read_user read_repository',
-        'state': request.user_id
+        'scope': 'read_user read_repository api',
+        'state': user_id
     }
     
     authorize_url = f"{GITLAB_URL}/oauth/authorize"
     query_string = "&".join(f"{k}={v}" for k, v in params.items())
     
-    return RedirectResponse(f"{authorize_url}?{query_string}", status_code=307)
-
+    return RedirectResponse(f"{authorize_url}?{query_string}")
 
 @app.get("/api/gitlab/oauth/callback")
 async def gitlab_callback(
@@ -653,9 +673,11 @@ async def gitlab_callback(
     state: str,
     background_tasks: BackgroundTasks
 ):
-    """Handle GitLab OAuth callback"""
+    """
+    Handle GitLab OAuth callback, using your personal user ID from state
+    """
     try:
-        user_id = state  # Get the user_id directly from state
+        personal_user_id = state  # This is your user ID from your system
         
         # Exchange code for token
         async with aiohttp.ClientSession() as session:
@@ -677,19 +699,20 @@ async def gitlab_callback(
             access_token = token_data['access_token']
             gitlab_user = await gitlab.verify_token(access_token)
             
-            # Rest of your existing code using the provided user_id
+            # Store repositories using your personal user ID
             async with db._session.begin():
                 async with aiohttp.ClientSession() as session:
                     projects_response = await session.get(
-                        f"{GITLAB_URL}/api/v4/projects?owned=true",
+                        f"{GITLAB_URL}/api/v4/projects?owned=true&simple=true",  # Added simple=true
                         headers={"Authorization": f"Bearer {access_token}"}
                     )
                     projects = await projects_response.json()
                 
                 processed_repos = []
                 for project in projects:
+                    # Use your personal user ID for storing the repository
                     stmt = select(UserRepository).where(
-                        UserRepository.user_id == user_id,
+                        UserRepository.user_id == personal_user_id,
                         UserRepository.gitlab_project_id == project['id']
                     )
                     result = await db._session.execute(stmt)
@@ -700,12 +723,12 @@ async def gitlab_callback(
                         repo.repository_url = project['web_url']
                     else:
                         repo = UserRepository(
-                            user_id=user_id,  
+                            user_id=personal_user_id,  # Your personal user ID
                             gitlab_project_id=project['id'],
                             repository_name=project['name'],
                             repository_url=project['web_url'],
-                            default_branch=project['default_branch'],
-                            visibility=project['visibility'],
+                            default_branch=project.get('default_branch'),
+                            visibility=project.get('visibility'),
                             size_mb=project.get('statistics', {}).get('repository_size', 0) / 1024 / 1024
                         )
                         db._session.add(repo)
@@ -713,9 +736,9 @@ async def gitlab_callback(
                     
                     scan = ScanResult(
                         repository_id=repo.id,
-                        user_id=user_id,  
+                        user_id=personal_user_id,  # Your personal user ID
                         status=ScanStatus.PENDING,
-                        branch=project['default_branch'],
+                        branch=project.get('default_branch'),
                         scan_date=datetime.utcnow()
                     )
                     db._session.add(scan)
@@ -730,7 +753,7 @@ async def gitlab_callback(
                     
                     background_tasks.add_task(
                         gitlab.scan_repository,
-                        user_id=user_id,
+                        user_id=personal_user_id,
                         repo_id=repo.id,
                         access_token=access_token,
                         gitlab_project_id=project['id'],
@@ -742,14 +765,14 @@ async def gitlab_callback(
                 'message': f'Successfully connected GitLab account and initiated scans for {len(processed_repos)} repositories',
                 'repositories': processed_repos,
                 'user': {
-                    'id': user_id,
+                    'personal_user_id': personal_user_id,
                     'gitlab_username': gitlab_user.username
                 }
             })
             
     except Exception as e:
-        logger.error("oauth_callback_failed", error=str(e))
-        raise HTTPException(status_code=500, detail="OAuth process failed")
+        logger.error(f"OAuth callback failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/gitlab/repos")
 async def list_repos(request: Request):
