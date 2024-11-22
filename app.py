@@ -58,40 +58,31 @@ ASYNC_DATABASE_URL = DATABASE_URL.replace('postgresql://', 'postgresql+asyncpg:/
 # Scanner Configuration
 @dataclass
 class GitLabScanConfig:
-    """Configuration for GitLab repository scanning optimized for low-resource environments"""
+    """Configuration for GitLab repository scanning without resource limits"""
     def __init__(self):
-        # Reduced memory limits
-        self.max_file_size_mb = 5        
-        self.max_total_size_mb = 50      
-        self.max_memory_mb = 200         
-        self.chunk_size_mb = 10          
-        self.max_files_per_chunk = 20    
+        self.max_file_size_mb = 5
+        self.max_total_size_mb = 50
+        self.chunk_size_mb = 10
+        self.max_files_per_chunk = 20
         
-        # Tighter timeouts
-        self.timeout_seconds = 180       
-        self.chunk_timeout = 60          
-        self.file_timeout_seconds = 10   
+        # Timeouts
+        self.timeout_seconds = 180
+        self.chunk_timeout = 60
+        self.file_timeout_seconds = 10
         
-        # Process control
-        self.max_retries = 1             
-        self.concurrent_processes = 1     
+        self.max_retries = 1
+        self.concurrent_processes = 1
         
-        # Exclude more patterns to reduce workload
         self.exclude_patterns = [
             '.git', '.svn', 'node_modules', 'vendor',
             'bower_components', 'packages', 'dist',
             'build', 'out', 'venv', '.env', '__pycache__',
-            '*.min.*', '*.bundle.*', '*.map', 
-            '*.{pdf,jpg,jpeg,png,gif,zip,tar,gz,rar,mp4,mov,svg,woff,woff2,eot,ttf,otf}',
-            'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml',
-            'coverage', 'test*', 'docs', 'examples',
-            '*.test.*', '*.spec.*', '*.d.ts',
-            'public', 'static', 'assets',
-            '*.lock', '*.sum', 'go.mod',
-            '*.pyc', '*.pyo', '*.pyd',
-            '*.so', '*.dylib', '*.dll',
-            '*.class', '*.jar', '*.war'
+            '*.min.*', '*.bundle.*', '*.map',
+            '*.{pdf,jpg,jpeg,png,gif,zip,tar,gz,rar,mp4,mov}',
+            'package-lock.json', 'yarn.lock',
+            'coverage', 'test*', 'docs'
         ]
+
 # Database Models
 Base = declarative_base()
 
@@ -236,20 +227,15 @@ class GitLabSecurityScanner:
             logger.error(f"Error during cleanup: {str(e)}")
 
     async def _clone_repository(self, clone_url: str, access_token: str, default_branch: str) -> Path:
-        """Optimized clone process for low-resource environments"""
+        """Clone repository without using resource limits"""
         try:
             self.repo_dir = self.temp_dir / f"repo_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             os.makedirs(self.repo_dir, exist_ok=True)
-
-            # Set strict resource limits
-            resource.setrlimit(resource.RLIMIT_AS, (300 * 1024 * 1024, -1))  # 300MB memory limit
             
             env = {
                 'GIT_HTTP_LOW_SPEED_LIMIT': '500',
                 'GIT_HTTP_LOW_SPEED_TIME': '30',
-                'GIT_ALLOC_LIMIT': '100M',
                 'GIT_PACK_THREADS': '1',
-                'GIT_HTTP_MAX_REQUEST_BUFFER': '50M',
                 'GIT_TRACE_PACKET': '0',
                 'GIT_TRACE': '0',
                 'GIT_CURL_VERBOSE': '0',
@@ -258,88 +244,102 @@ class GitLabSecurityScanner:
                 'GIT_FLUSH': '1'
             }
 
-            # Initialize bare repository to save resources
+            # Initialize repository
             await asyncio.create_subprocess_shell(
-                f"git init --bare {self.repo_dir}",
+                f"git init {self.repo_dir}",
                 env=env
             )
 
-            # Fetch only the specific branch with minimal history
-            auth_url = clone_url.replace('https://', f'https://oauth2:{access_token}@')
-            fetch_cmd = [
-                'git', 'fetch',
-                '--depth=1',
-                '--no-tags',
-                '--filter=blob:none',
-                '--no-recurse-submodules',
-                '--single-branch',
-                auth_url,
-                f'{default_branch}:refs/heads/{default_branch}'
+            # Configure sparse checkout
+            config_commands = [
+                f"cd {self.repo_dir}",
+                "git config core.sparsecheckout true",
+                "echo '/*' > .git/info/sparse-checkout",
+                "git config --local gc.auto 0",
+                f"git remote add origin {clone_url.replace('https://', f'https://oauth2:{access_token}@')}"
             ]
+            
+            for cmd in config_commands:
+                process = await asyncio.create_subprocess_shell(
+                    cmd,
+                    env=env,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await process.communicate()
 
-            process = await asyncio.create_subprocess_exec(
-                *fetch_cmd,
-                cwd=str(self.repo_dir),
+            # Fetch only the tip of the branch
+            fetch_cmd = (
+                f"cd {self.repo_dir} && "
+                f"git -c protocol.version=2 fetch --depth=1 --no-tags --filter=blob:none "
+                f"origin {default_branch}:refs/remotes/origin/{default_branch}"
+            )
+
+            process = await asyncio.create_subprocess_shell(
+                fetch_cmd,
                 env=env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
 
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=60
-                )
-            except asyncio.TimeoutError:
-                process.terminate()
-                raise TimeoutError("Clone operation timed out")
-
+            stdout, stderr = await process.communicate()
             if process.returncode != 0:
-                raise Exception(f"Clone failed: {stderr.decode()}")
+                raise Exception(f"Fetch failed: {stderr.decode()}")
 
-            # Checkout the fetched branch
-            checkout_cmd = f"git --work-tree={self.repo_dir} --git-dir={self.repo_dir}/.git checkout -f {default_branch}"
+            # Checkout the branch
+            checkout_cmd = (
+                f"cd {self.repo_dir} && "
+                f"git checkout -f -B {default_branch} refs/remotes/origin/{default_branch}"
+            )
+            
             process = await asyncio.create_subprocess_shell(
                 checkout_cmd,
-                env=env
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
             )
-            await process.wait()
+            
+            stdout, stderr = await process.communicate()
+            if process.returncode != 0:
+                raise Exception(f"Checkout failed: {stderr.decode()}")
 
             return self.repo_dir
 
         except Exception as e:
             if self.repo_dir and self.repo_dir.exists():
                 shutil.rmtree(self.repo_dir)
-            raise RuntimeError(f"Repository clone failed: {str(e)}")
+            raise Exception(f"Clone failed: {str(e)}")
+
 
             
     async def _scan_chunk(self, files: List[str]) -> List[Dict]:
-        """Memory-efficient chunk scanning"""
+        """Scan a chunk of files with comprehensive security rules"""
         try:
-            # Basic ruleset to reduce memory usage
             cmd = [
                 "semgrep",
                 "scan",
                 "--json",
-                "--config", "p/ci",  # Using simpler ruleset
+                "--config", "p/security-audit",    # Comprehensive security checks
+                "--config", "p/owasp-top-ten",     # OWASP Top 10 vulnerabilities
+                "--config", "p/ci",                # Basic CI checks
+                "--config", "p/secrets",           # Secrets detection
+                "--config", "p/auth",              # Authentication issues
+                "--config", "p/insecure-transport", # Insecure data transmission
                 "--metrics=off",
-                f"--max-memory={self.config.max_memory_mb}M",
+                "--optimizations=all",
                 "--timeout", str(self.config.file_timeout_seconds),
+                "--max-target-bytes", str(5 * 1024 * 1024),  # 5MB per file
                 "--timeout-threshold", "2",
-                "--no-git-ignore",
+                "--severity", "ERROR,WARNING,INFO"  # Include all severity levels
             ] + files
 
-            # Set resource limits for the subprocess
-            def limit_resources():
-                resource.setrlimit(resource.RLIMIT_AS, (300 * 1024 * 1024, -1))  # 300MB memory limit
-                os.nice(10)  # Lower CPU priority
+            logger.info(f"Starting scan with {len(files)} files using comprehensive ruleset")
 
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                limit=5 * 1024 * 1024,  # 5MB buffer
-                preexec_fn=limit_resources
+                limit=5 * 1024 * 1024  # 5MB buffer
             )
 
             try:
@@ -347,64 +347,93 @@ class GitLabSecurityScanner:
                     process.communicate(),
                     timeout=self.config.chunk_timeout
                 )
-                return self._parse_semgrep_output(stdout, stderr)
+
+                stdout_output = stdout.decode() if stdout else ""
+                stderr_output = stderr.decode() if stderr else ""
+
+                if stderr_output:
+                    if "error: missing required key" in stderr_output.lower():
+                        # Handle case where some rulesets might not be available
+                        logger.warning("Some rulesets unavailable, falling back to basic security scan")
+                        return await self._fallback_scan(files)
+                    logger.info(f"Semgrep stderr output: {stderr_output}")
+
+                if not stdout_output.strip():
+                    return []
+
+                results = json.loads(stdout_output)
+                findings = results.get('results', [])
+                
+                # Enhanced logging for findings
+                if findings:
+                    severities = {}
+                    categories = {}
+                    for finding in findings:
+                        sev = finding.get('extra', {}).get('severity', 'unknown')
+                        cat = finding.get('extra', {}).get('metadata', {}).get('category', 'unknown')
+                        severities[sev] = severities.get(sev, 0) + 1
+                        categories[cat] = categories.get(cat, 0) + 1
+                    
+                    logger.info(
+                        f"Scan completed: Found {len(findings)} issues\n"
+                        f"Severities: {severities}\n"
+                        f"Categories: {categories}"
+                    )
+                
+                return findings
+
             except asyncio.TimeoutError:
-                process.terminate()
+                if process.returncode is None:
+                    process.terminate()
+                    await process.wait()
+                logger.warning(f"Scan timeout for chunk with {len(files)} files")
                 return []
 
         except Exception as e:
             logger.error(f"Chunk scan error: {str(e)}")
             return []
 
-    def _process_results(self, findings: List[Dict]) -> Dict:
-        """Process and categorize scan findings with enhanced metadata"""
-        severity_counts = {'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0}
-        category_counts = {}
-        processed_findings = []
-        files_with_findings = set()
+    async def _fallback_scan(self, files: List[str]) -> List[Dict]:
+        """Fallback scan with basic security rules if comprehensive scan fails"""
+        try:
+            cmd = [
+                "semgrep",
+                "scan",
+                "--json",
+                "--config", "p/security-audit",  # Keep at least the security audit
+                "--metrics=off",
+                "--optimizations=all",
+                "--timeout", str(self.config.file_timeout_seconds),
+                "--max-target-bytes", str(5 * 1024 * 1024),
+                "--timeout-threshold", "2",
+                "--severity", "ERROR,WARNING,INFO"
+            ] + files
 
-        for finding in findings:
-            severity = finding.get('extra', {}).get('severity', 'LOW').upper()
-            category = finding.get('extra', {}).get('metadata', {}).get('category', 'security')
-            file_path = finding.get('path', '')
-            
-            severity_counts[severity] = severity_counts.get(severity, 0) + 1
-            category_counts[category] = category_counts.get(category, 0) + 1
-            
-            if file_path:
-                files_with_findings.add(file_path)
-            
-            processed_findings.append({
-                'id': finding.get('check_id'),
-                'file': file_path,
-                'line_start': finding.get('start', {}).get('line'),
-                'line_end': finding.get('end', {}).get('line'),
-                'code_snippet': finding.get('extra', {}).get('lines', ''),
-                'message': finding.get('extra', {}).get('message', ''),
-                'severity': severity,
-                'category': category,
-                'cwe': finding.get('extra', {}).get('metadata', {}).get('cwe', []),
-                'owasp': finding.get('extra', {}).get('metadata', {}).get('owasp', []),
-                'references': finding.get('extra', {}).get('metadata', {}).get('references', []),
-                'fix_recommendations': finding.get('extra', {}).get('metadata', {}).get('fix', '')
-            })
+            logger.info("Falling back to basic security scan")
 
-        self.scan_stats.update({
-            'findings_count': len(findings),
-            'files_with_findings': len(files_with_findings),
-            'memory_usage_mb': psutil.Process().memory_info().rss / (1024 * 1024)
-        })
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                limit=5 * 1024 * 1024
+            )
 
-        return {
-            'findings': processed_findings[:100],  # Limit to 100 findings as before
-            'stats': {
-                'total_findings': len(findings),
-                'severity_counts': severity_counts,
-                'category_counts': category_counts,
-                'scan_stats': self.scan_stats
-            }
-        }
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=self.config.chunk_timeout
+            )
 
+            stdout_output = stdout.decode() if stdout else ""
+            if not stdout_output.strip():
+                return []
+
+            results = json.loads(stdout_output)
+            return results.get('results', [])
+
+        except Exception as e:
+            logger.error(f"Fallback scan error: {str(e)}")
+            return []
+    
     async def _run_chunked_scan(self, target_dir: Path) -> Dict:
         all_files = []
         chunks = []
