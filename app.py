@@ -265,11 +265,14 @@ class GitLabSecurityScanner:
                 "semgrep",
                 "scan",
                 "--json",
-                "--config", "auto",  # Use the CI ruleset from registry
-                "--metrics=on",  # Explicitly disable metrics
+                "--config", "p/ci",  # Changed back to p/ci from auto
+                "--metrics=off",     # Explicitly disable metrics
                 f"--max-memory={self.config.max_memory_mb}",
                 "--optimizations=all",
-                "--timeout", str(self.config.file_timeout_seconds),   
+                "--timeout", str(self.config.file_timeout_seconds),
+                "--severity", "INFO",  # Add this to get more findings
+                "--max-target-bytes", str(25 * 1024 * 1024),  # 25MB limit per file
+                "--timeout-threshold", "3"  # Skip files that take too long
             ] + files
 
             process = await asyncio.create_subprocess_exec(
@@ -296,10 +299,10 @@ class GitLabSecurityScanner:
             stderr_output = stderr.decode() if stderr else ""
 
             # Log errors that aren't just informational
-            if stderr_output and not any(x in stderr_output for x in ['METRICS:', 'Running autofix']):
+            if stderr_output and not any(x in stderr_output.lower() for x in ['metrics:', 'running autofix', 'scan status']):
                 logger.warning(f"Semgrep stderr: {stderr_output}")
 
-            if process.returncode not in [0, 1]:
+            if process.returncode not in [0, 1, 2]:  # Added 2 as acceptable return code
                 logger.error(f"Semgrep exited with code {process.returncode}")
                 if stderr_output:
                     logger.error(f"Error details: {stderr_output}")
