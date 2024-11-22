@@ -265,8 +265,9 @@ class GitLabSecurityScanner:
                 "semgrep",
                 "scan",
                 "--json",
-                "--config", "p/security-audit",  # Changed to security-audit ruleset for broader coverage
-                "--config", "p/owasp-top-ten",   # Added OWASP Top 10 ruleset
+                "--config", "p/security-audit",  # Comprehensive security ruleset
+                "--config", "p/owasp-top-ten",   # OWASP Top 10 rules
+                "--config", "p/secrets",         # Add secrets detection
                 "--metrics=off",
                 f"--max-memory={self.config.max_memory_mb}",
                 "--optimizations=all",
@@ -274,9 +275,8 @@ class GitLabSecurityScanner:
                 "--severity", "INFO",
                 "--max-target-bytes", str(25 * 1024 * 1024),
                 "--timeout-threshold", "3",
-                "--no-git-ignore",  # Scan all files, not just git tracked ones
-                "--enable-metrics",  # Enable detailed metrics for better findings
-                "--verbose"  # Add verbose output for debugging
+                "--no-git-ignore",  # Scan all files
+                "--verbose"
             ] + files
 
             process = await asyncio.create_subprocess_exec(
@@ -301,12 +301,13 @@ class GitLabSecurityScanner:
             stdout_output = stdout.decode() if stdout else ""
             stderr_output = stderr.decode() if stderr else ""
 
-            # Log all stderr output for debugging
-            if stderr_output:
+            # More detailed logging
+            logger.info(f"Scanning {len(files)} files with Semgrep")
+            if stderr_output and not "Running autofix" in stderr_output:
                 logger.info(f"Semgrep stderr output: {stderr_output}")
 
-            # Accept more return codes as valid
-            if process.returncode not in [0, 1, 2, 3]:
+            # Handle exit codes
+            if process.returncode not in [0, 1, 2]:
                 logger.error(f"Semgrep exited with code {process.returncode}")
                 if stderr_output:
                     logger.error(f"Error details: {stderr_output}")
@@ -320,7 +321,7 @@ class GitLabSecurityScanner:
                 results = json.loads(stdout_output)
                 findings = results.get('results', [])
                 
-                # Enhanced logging with detailed metrics
+                # Enhanced logging
                 if findings:
                     severities = {}
                     categories = {}
@@ -331,12 +332,12 @@ class GitLabSecurityScanner:
                         categories[cat] = categories.get(cat, 0) + 1
                     
                     logger.info(
-                        f"Scan completed: {len(findings)} findings\n"
+                        f"Scan completed: Found {len(findings)} issues\n"
                         f"Severities: {severities}\n"
                         f"Categories: {categories}"
                     )
                 else:
-                    logger.warning("Scan completed: No findings - this might indicate a configuration issue")
+                    logger.info(f"Scan completed: No findings in {len(files)} files")
                 
                 return findings
 
