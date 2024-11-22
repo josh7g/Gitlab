@@ -58,29 +58,40 @@ ASYNC_DATABASE_URL = DATABASE_URL.replace('postgresql://', 'postgresql+asyncpg:/
 # Scanner Configuration
 @dataclass
 class GitLabScanConfig:
-    """Configuration for GitLab repository scanning"""
-    max_file_size_mb: int = 25
-    max_total_size_mb: int = 300
-    max_memory_mb: int = 1500
-    chunk_size_mb: int = 30
-    max_files_per_chunk: int = 50
-    
-    timeout_seconds: int = 540  # 9 minutes
-    chunk_timeout: int = 120    # 2 minutes per chunk
-    file_timeout_seconds: int = 20
-    max_retries: int = 2
-    concurrent_processes: int = 1
-
-    exclude_patterns: List[str] = field(default_factory=lambda: [
-        '.git', '.svn', 'node_modules', 'vendor',
-        'bower_components', 'packages', 'dist',
-        'build', 'out', 'venv', '.env', '__pycache__',
-        '*.min.*', '*.bundle.*', '*.map', 
-        '*.{pdf,jpg,jpeg,png,gif,zip,tar,gz,rar,mp4,mov}',
-        'package-lock.json', 'yarn.lock',
-        'coverage', 'test*', 'docs'
-    ])
-
+    """Configuration for GitLab repository scanning optimized for low-resource environments"""
+    def __init__(self):
+        # Reduced memory limits
+        self.max_file_size_mb = 5        
+        self.max_total_size_mb = 50      
+        self.max_memory_mb = 200         
+        self.chunk_size_mb = 10          
+        self.max_files_per_chunk = 20    
+        
+        # Tighter timeouts
+        self.timeout_seconds = 180       
+        self.chunk_timeout = 60          
+        self.file_timeout_seconds = 10   
+        
+        # Process control
+        self.max_retries = 1             
+        self.concurrent_processes = 1     
+        
+        # Exclude more patterns to reduce workload
+        self.exclude_patterns = [
+            '.git', '.svn', 'node_modules', 'vendor',
+            'bower_components', 'packages', 'dist',
+            'build', 'out', 'venv', '.env', '__pycache__',
+            '*.min.*', '*.bundle.*', '*.map', 
+            '*.{pdf,jpg,jpeg,png,gif,zip,tar,gz,rar,mp4,mov,svg,woff,woff2,eot,ttf,otf}',
+            'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml',
+            'coverage', 'test*', 'docs', 'examples',
+            '*.test.*', '*.spec.*', '*.d.ts',
+            'public', 'static', 'assets',
+            '*.lock', '*.sum', 'go.mod',
+            '*.pyc', '*.pyo', '*.pyd',
+            '*.so', '*.dylib', '*.dll',
+            '*.class', '*.jar', '*.war'
+        ]
 # Database Models
 Base = declarative_base()
 
@@ -225,115 +236,110 @@ class GitLabSecurityScanner:
             logger.error(f"Error during cleanup: {str(e)}")
 
     async def _clone_repository(self, clone_url: str, access_token: str, default_branch: str) -> Path:
-        """Clone repository with optimized resource usage and better error handling"""
+        """Optimized clone process for low-resource environments"""
         try:
             self.repo_dir = self.temp_dir / f"repo_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            auth_url = clone_url.replace('https://', f'https://oauth2:{access_token}@')
+            os.makedirs(self.repo_dir, exist_ok=True)
+
+            # Set strict resource limits
+            resource.setrlimit(resource.RLIMIT_AS, (300 * 1024 * 1024, -1))  # 300MB memory limit
             
-            logger.info(f"Cloning repository to {self.repo_dir}")
-            
-            # Reduce resource usage during clone
             env = {
-                'GIT_HTTP_LOW_SPEED_LIMIT': '1000',
-                'GIT_HTTP_LOW_SPEED_TIME': '10',
-                'GIT_ALLOC_LIMIT': '256M',
+                'GIT_HTTP_LOW_SPEED_LIMIT': '500',
+                'GIT_HTTP_LOW_SPEED_TIME': '30',
+                'GIT_ALLOC_LIMIT': '100M',
                 'GIT_PACK_THREADS': '1',
-                'GIT_HTTP_MAX_REQUEST_BUFFER': '100M',
+                'GIT_HTTP_MAX_REQUEST_BUFFER': '50M',
                 'GIT_TRACE_PACKET': '0',
                 'GIT_TRACE': '0',
-                'GIT_CURL_VERBOSE': '0'
+                'GIT_CURL_VERBOSE': '0',
+                'GIT_DISCOVERY_ACROSS_FILESYSTEM': '0',
+                'GIT_CONFIG_NOSYSTEM': '1',
+                'GIT_FLUSH': '1'
             }
-            
-            # Split the clone into multiple steps for better control
-            os.makedirs(self.repo_dir, exist_ok=True)
-            
-            # Initialize repository
-            repo = git.Repo.init(self.repo_dir)
-            
-            # Add remote
-            origin = repo.create_remote('origin', auth_url)
-            
-            # Fetch specific branch with limited history
-            git_options = [
-                '-c', 'protocol.version=2',  # Use protocol v2 for better performance
-                '-c', 'pack.threads=1',      # Limit pack threads
-                '-c', 'pack.windowMemory=100m', # Limit memory usage
-                'fetch',
-                'origin',
-                default_branch,
+
+            # Initialize bare repository to save resources
+            await asyncio.create_subprocess_shell(
+                f"git init --bare {self.repo_dir}",
+                env=env
+            )
+
+            # Fetch only the specific branch with minimal history
+            auth_url = clone_url.replace('https://', f'https://oauth2:{access_token}@')
+            fetch_cmd = [
+                'git', 'fetch',
                 '--depth=1',
                 '--no-tags',
                 '--filter=blob:none',
-                '--no-recurse-submodules'
+                '--no-recurse-submodules',
+                '--single-branch',
+                auth_url,
+                f'{default_branch}:refs/heads/{default_branch}'
             ]
-            
-            # Execute fetch command
-            fetch_process = await asyncio.create_subprocess_exec(
-                'git',
-                *git_options,
+
+            process = await asyncio.create_subprocess_exec(
+                *fetch_cmd,
                 cwd=str(self.repo_dir),
                 env=env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
-            
-            stdout, stderr = await fetch_process.communicate()
-            
-            if fetch_process.returncode != 0:
-                raise Exception(f"Fetch failed: {stderr.decode()}")
-            
+
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=60
+                )
+            except asyncio.TimeoutError:
+                process.terminate()
+                raise TimeoutError("Clone operation timed out")
+
+            if process.returncode != 0:
+                raise Exception(f"Clone failed: {stderr.decode()}")
+
             # Checkout the fetched branch
-            repo.git.checkout('FETCH_HEAD', '-f')
-            
-            logger.info(f"Successfully cloned repository to {self.repo_dir}")
+            checkout_cmd = f"git --work-tree={self.repo_dir} --git-dir={self.repo_dir}/.git checkout -f {default_branch}"
+            process = await asyncio.create_subprocess_shell(
+                checkout_cmd,
+                env=env
+            )
+            await process.wait()
+
             return self.repo_dir
 
         except Exception as e:
-            error_msg = str(e)
-            logger.error(f"Repository clone failed: {error_msg}")
             if self.repo_dir and self.repo_dir.exists():
                 shutil.rmtree(self.repo_dir)
-            
-            # Check for specific error conditions and provide more detail
-            if "unable to create thread" in error_msg:
-                raise RuntimeError(
-                    "System resource limit reached. The server is temporarily unable to process "
-                    "the request due to resource constraints. Please try again in a few minutes."
-                )
-            elif "could not fetch" in error_msg:
-                raise RuntimeError(
-                    "Failed to fetch repository data. This might be due to network issues "
-                    "or repository access permissions. Please verify the repository URL and permissions."
-                )
-            else:
-                raise RuntimeError(f"Repository clone failed: {error_msg}")
+            raise RuntimeError(f"Repository clone failed: {str(e)}")
+
             
     async def _scan_chunk(self, files: List[str]) -> List[Dict]:
-        """Scan a single chunk of files using Semgrep comprehensive rulesets"""
+        """Memory-efficient chunk scanning"""
         try:
+            # Basic ruleset to reduce memory usage
             cmd = [
                 "semgrep",
                 "scan",
                 "--json",
-                "--config", "p/security-audit",  # Comprehensive security ruleset
-                "--config", "p/owasp-top-ten",   # OWASP Top 10 rules
-                "--config", "p/secrets",         # Add secrets detection
+                "--config", "p/ci",  # Using simpler ruleset
                 "--metrics=off",
-                f"--max-memory={self.config.max_memory_mb}",
-                "--optimizations=all",
+                f"--max-memory={self.config.max_memory_mb}M",
                 "--timeout", str(self.config.file_timeout_seconds),
-                "--severity", "INFO",
-                "--max-target-bytes", str(25 * 1024 * 1024),
-                "--timeout-threshold", "3",
-                "--no-git-ignore",  # Scan all files
-                "--verbose"
+                "--timeout-threshold", "2",
+                "--no-git-ignore",
             ] + files
+
+            # Set resource limits for the subprocess
+            def limit_resources():
+                resource.setrlimit(resource.RLIMIT_AS, (300 * 1024 * 1024, -1))  # 300MB memory limit
+                os.nice(10)  # Lower CPU priority
 
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                limit=1024 * 1024 * 10
+                limit=5 * 1024 * 1024,  # 5MB buffer
+                preexec_fn=limit_resources
             )
 
             try:
@@ -341,63 +347,13 @@ class GitLabSecurityScanner:
                     process.communicate(),
                     timeout=self.config.chunk_timeout
                 )
+                return self._parse_semgrep_output(stdout, stderr)
             except asyncio.TimeoutError:
-                if process.returncode is None:
-                    process.terminate()
-                    await process.wait()
-                logger.warning(f"Scan timeout for chunk with {len(files)} files")
-                return []
-
-            stdout_output = stdout.decode() if stdout else ""
-            stderr_output = stderr.decode() if stderr else ""
-
-            # More detailed logging
-            logger.info(f"Scanning {len(files)} files with Semgrep")
-            if stderr_output and not "Running autofix" in stderr_output:
-                logger.info(f"Semgrep stderr output: {stderr_output}")
-
-            # Handle exit codes
-            if process.returncode not in [0, 1, 2]:
-                logger.error(f"Semgrep exited with code {process.returncode}")
-                if stderr_output:
-                    logger.error(f"Error details: {stderr_output}")
-                return []
-
-            if not stdout_output.strip():
-                logger.warning("No output from Semgrep scan")
-                return []
-
-            try:
-                results = json.loads(stdout_output)
-                findings = results.get('results', [])
-                
-                # Enhanced logging
-                if findings:
-                    severities = {}
-                    categories = {}
-                    for finding in findings:
-                        sev = finding.get('extra', {}).get('severity', 'unknown')
-                        cat = finding.get('extra', {}).get('metadata', {}).get('category', 'unknown')
-                        severities[sev] = severities.get(sev, 0) + 1
-                        categories[cat] = categories.get(cat, 0) + 1
-                    
-                    logger.info(
-                        f"Scan completed: Found {len(findings)} issues\n"
-                        f"Severities: {severities}\n"
-                        f"Categories: {categories}"
-                    )
-                else:
-                    logger.info(f"Scan completed: No findings in {len(files)} files")
-                
-                return findings
-
-            except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse Semgrep output: {str(e)}\nOutput was: {stdout_output[:1000]}")
+                process.terminate()
                 return []
 
         except Exception as e:
-            logger.error(f"Error during chunk scan: {str(e)}")
-            logger.exception("Full exception details:")
+            logger.error(f"Chunk scan error: {str(e)}")
             return []
 
     def _process_results(self, findings: List[Dict]) -> Dict:
