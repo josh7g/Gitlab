@@ -270,9 +270,7 @@ class GitLabSecurityScanner:
                 f"--max-memory={self.config.max_memory_mb}",
                 "--optimizations=all",
                 "--timeout", str(self.config.file_timeout_seconds),
-                "--severity", "INFO",  # Add this to get more findings
-                "--max-target-bytes", str(25 * 1024 * 1024),  # 25MB limit per file
-                "--timeout-threshold", "3"  # Skip files that take too long
+              
             ] + files
 
             process = await asyncio.create_subprocess_exec(
