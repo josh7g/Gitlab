@@ -283,7 +283,7 @@ class GitLabSecurityScanner:
                 "semgrep",
                 "scan",
                 "--json",
-                "--config", "auto",    
+                "--config", "p/security-audit",    
                 "--metrics=off",
                 "--optimizations=all",
                 "--timeout", str(self.config.file_timeout_seconds),
