@@ -283,18 +283,18 @@ class GitLabSecurityScanner:
                 "semgrep",
                 "scan",
                 "--json",
-                "--config", "p/security-audit",    # Comprehensive security checks
-                "--config", "p/owasp-top-ten",     # OWASP Top 10 vulnerabilities
-                "--config", "p/ci",                # Basic CI checks
-                "--config", "p/secrets",           # Secrets detection
-                "--config", "p/auth",              # Authentication issues
-                "--config", "p/insecure-transport", # Insecure data transmission
+                "--config", "p/security-audit",    
+                "--config", "p/owasp-top-ten",     
+                "--config", "p/ci",                
+                "--config", "p/secrets",           
+                "--config", "p/auth",              
+                "--config", "p/insecure-transport",
                 "--metrics=off",
                 "--optimizations=all",
                 "--timeout", str(self.config.file_timeout_seconds),
-                "--max-target-bytes", str(5 * 1024 * 1024),  # 5MB per file
+                "--max-target-bytes", str(5 * 1024 * 1024),
                 "--timeout-threshold", "2",
-                "--severity", "ERROR,WARNING,INFO"  # Include all severity levels
+                "--severity", "INFO"  # Changed to single severity - will include all levels INFO and above
             ] + files
 
             logger.info(f"Starting scan with {len(files)} files using comprehensive ruleset")
@@ -303,24 +303,18 @@ class GitLabSecurityScanner:
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                limit=5 * 1024 * 1024  # 5MB buffer
+                limit=5 * 1024 * 1024
             )
 
             try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=self.config.chunk_timeout
-                )
+                stdout, stderr = await process.communicate()
 
                 stdout_output = stdout.decode() if stdout else ""
                 stderr_output = stderr.decode() if stderr else ""
 
-                if stderr_output:
-                    if "error: missing required key" in stderr_output.lower():
-                        # Handle case where some rulesets might not be available
-                        logger.warning("Some rulesets unavailable, falling back to basic security scan")
-                        return await self._fallback_scan(files)
-                    logger.info(f"Semgrep stderr output: {stderr_output}")
+                if stderr_output and "error: missing required key" in stderr_output.lower():
+                    logger.warning("Some rulesets unavailable, falling back to basic security scan")
+                    return await self._fallback_scan(files)
 
                 if not stdout_output.strip():
                     return []
@@ -328,7 +322,6 @@ class GitLabSecurityScanner:
                 results = json.loads(stdout_output)
                 findings = results.get('results', [])
                 
-                # Enhanced logging for findings
                 if findings:
                     severities = {}
                     categories = {}
@@ -339,7 +332,7 @@ class GitLabSecurityScanner:
                         categories[cat] = categories.get(cat, 0) + 1
                     
                     logger.info(
-                        f"Scan completed: Found {len(findings)} issues\n"
+                        f"Found {len(findings)} issues\n"
                         f"Severities: {severities}\n"
                         f"Categories: {categories}"
                     )
